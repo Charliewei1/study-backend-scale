@@ -1,0 +1,399 @@
+---
+title: "Day 9 - Kubernetes 入門: kind で動かす"
+description: kind でローカル Kubernetes クラスタを作り、Pod、ReplicaSet、Deployment、Service、label selector、kubectl の基本を学びます。
+sidebar:
+  label: Day 9
+  order: 9
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+## 今日のゴール
+
+- Kubernetes が Docker Compose と比べて何を解決するのか説明できるようになる。
+- Pod、ReplicaSet、Deployment、Service の関係を図で説明できるようになる。
+- label selector が Kubernetes リソース同士をつなぐ中心だと理解する。
+- kind がローカル Docker 上に Kubernetes クラスタを作る道具だと説明できるようになる。
+- `kubectl get`、`describe`、`logs`、`exec` の基本動詞を使えるようになる。
+- `kind load docker-image` が必要な理由を説明できるようになる。
+- Pod を 1 つ削除しても Deployment が自己修復する様子を観察できるようになる。
+
+## 解説
+
+Day 8 までは、Docker Compose で app、Postgres、Redis を同じ開発環境に並べてきました。
+Compose はとても便利です。
+複数コンテナをまとめて起動し、サービス名 DNS でつなぎ、volume や healthcheck も書けます。
+
+ただし、本番に近いスケールを考えると、Compose だけでは足りない領域が出てきます。
+複数ホストにまたがってコンテナを配置したい。
+落ちたコンテナを自動で戻したい。
+「今 2 個起動しておきたい」という望ましい状態を宣言し、その状態からずれたら戻してほしい。
+アプリの Pod が入れ替わっても、安定した宛先でアクセスしたい。
+
+Kubernetes は、このようなコンテナ運用の問題を解くための仕組みです。
+今日はいきなり本番クラスタを触るのではなく、kind でローカルに小さな Kubernetes クラスタを作り、shortlink を 2 つの Pod として動かします。
+
+### Compose と Kubernetes の違い
+
+Compose は、1 台の Docker 環境に複数コンテナを並べる道具として強力です。
+開発環境では十分便利ですが、複数ホストへの配置、自己修復、Pod が入れ替わっても使える安定した宛先までは面倒を見ません。
+
+Kubernetes は、さらに一段広い問題を扱います。
+「コンテナを今すぐ 2 個起動して」と命令するのではなく、「Pod が 2 個ある状態を保って」と宣言し、コントローラが実際の状態を近づけ続けます。
+たとえば `replicas: 2` と書いた状態で Pod が 1 つ落ちると、Kubernetes は新しい Pod を作って 2 つへ戻します。
+この性質を自己修復と呼びます。
+
+### kind とは何か
+
+kind は Kubernetes in Docker の略です。
+Docker コンテナを Kubernetes のノードとして使い、ローカルマシン上に学習用のクラスタを作ります。
+
+今日使う設定は `deploy/kind-config.yaml` です。
+中身は `apiVersion: kind.x-k8s.io/v1alpha4`、`kind: Cluster`、`nodes: [{role: control-plane}]` というシンプルな 1 ノード構成です。
+`control-plane` は Kubernetes API server などを動かす管理ノードです。
+本番では複数ノードに分けることが多いですが、今日は Pod、Deployment、Service の関係を学ぶことに集中します。
+
+kind で注意したいのは、ローカルの Docker と kind クラスタ内のコンテナランタイムは別物だという点です。
+手元で `docker build -t shortlink:dev` しても、kind のノードはそのイメージをまだ知りません。
+そのため、あとで `kind load docker-image shortlink:dev --name shortlink` でイメージをクラスタへ読み込みます。
+
+### 今日使う Kubernetes リソース
+
+今日のマニフェストは `deploy/k8s/base/` にあります。
+
+```txt title="deploy/k8s/base/ の構成"
+deploy/k8s/base/
+  00-namespace.yaml
+  deployment.yaml
+  service.yaml
+```
+
+`00-namespace.yaml` は Namespace を作ります。
+Namespace は、クラスタ内のリソースを論理的に分ける単位です。
+今回の Deployment と Service は `shortlink` Namespace に置きます。
+
+```yaml title="deploy/k8s/base/00-namespace.yaml"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shortlink
+  labels:
+    app.kubernetes.io/name: shortlink
+    app.kubernetes.io/part-of: study-backend-scale
+```
+
+ファイル名を `00-namespace.yaml` にしているのは、実践的な小ネタです。
+`kubectl apply -f k8s/base` のようにディレクトリをまとめて適用するとき、ファイル名の順で処理されます。
+Namespace が先に作られていないと、その Namespace に置く Deployment や Service の作成に失敗します。
+そこで `00-` を付けて、Namespace が先に適用されやすい名前にしています。
+
+### Deployment は Pod 数を保つ宣言
+
+shortlink のアプリ本体は `deploy/k8s/base/deployment.yaml` です。
+ここでは `replicas: 2` として、Pod を 2 つ起動する望ましい状態を宣言しています。
+
+```yaml title="deploy/k8s/base/deployment.yaml"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shortlink
+  namespace: shortlink
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: shortlink
+      app.kubernetes.io/instance: shortlink
+```
+
+Deployment は、直接 Pod を手作業で 2 個作るわけではありません。
+Deployment が ReplicaSet を作り、ReplicaSet が Pod 数を保ちます。
+
+関係をテキスト図にすると、こうです。
+
+```txt title="Deployment / ReplicaSet / Pod / Service の関係"
+Deployment shortlink
+  declares: replicas = 2
+  selector:
+    app.kubernetes.io/name=shortlink
+    app.kubernetes.io/instance=shortlink
+        |
+        v
+ReplicaSet shortlink-xxxxx
+  keeps 2 matching Pods alive
+        |
+        +--> Pod shortlink-xxxxx-aaaaa
+        +--> Pod shortlink-xxxxx-bbbbb
+
+Service shortlink
+  selector:
+    app.kubernetes.io/name=shortlink
+    app.kubernetes.io/instance=shortlink
+        |
+        v
+  sends traffic to matching Pods
+```
+
+Deployment は更新の入口です。
+将来イメージタグを変えたり、環境変数を変えたりすると、Deployment が新しい ReplicaSet を作り、古い Pod から新しい Pod へ入れ替えていきます。
+このローリング更新は Day 10 で扱います。
+
+ReplicaSet は Pod の数を保つ係です。
+今日の `replicas: 2` なら、対象 Pod が 1 つになったときに新しい Pod を作ります。
+普段は ReplicaSet を直接編集するより、Deployment を編集します。
+
+Pod は Kubernetes で動く最小の実行単位です。
+1 つ以上のコンテナを含みます。
+今日の Pod には shortlink コンテナが 1 つだけ入っています。
+
+### Pod template と imagePullPolicy
+
+Deployment の `template` は、作成する Pod のひな形です。
+ここに Pod のラベル、コンテナイメージ、環境変数、ポートを書きます。
+
+```yaml title="deploy/k8s/base/deployment.yaml"
+template:
+  metadata:
+    labels:
+      app.kubernetes.io/name: shortlink
+      app.kubernetes.io/instance: shortlink
+  spec:
+    containers:
+      - name: shortlink
+        image: shortlink:dev
+        imagePullPolicy: Never
+        env:
+          - name: STORAGE
+            value: memory
+```
+
+`image: shortlink:dev` は、今日ローカルでビルドするイメージ名です。
+`imagePullPolicy: Never` は、外部レジストリへ取りに行かず、kind クラスタ内に読み込まれたローカルイメージだけを使う指定です。
+だから `kind load docker-image` が必要になります。
+
+`STORAGE=memory` も今日のポイントです。
+Day 6 から Postgres、Day 8 から Redis を使ってきましたが、Day 9 では Kubernetes の基本構造に集中するため、アプリはメモリ保存で動かします。
+Pod が入れ替わるとメモリ上のデータは消えるので、本番向きではありません。
+今日はあえてその制約を受け入れ、Pod と Service の接続を学びます。
+
+### Service は Pod の前に立つ安定した宛先
+
+Pod は作り直されるものです。
+名前も IP も変わります。
+もしクライアントが Pod の IP を直接覚えていたら、Pod が再作成された瞬間につながらなくなります。
+
+そこで Service を使います。
+今日の Service は `deploy/k8s/base/service.yaml` です。
+
+```yaml title="deploy/k8s/base/service.yaml"
+apiVersion: v1
+kind: Service
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: shortlink
+    app.kubernetes.io/instance: shortlink
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+```
+
+`type: ClusterIP` は、クラスタ内部向けの仮想 IP を作る基本的な Service です。
+Service は `port: 80` で受け、Pod の `targetPort: 8080` へ流します。
+ローカルマシンから直接 ClusterIP へは通常アクセスできないので、今日は `kubectl port-forward svc/shortlink 8080:80 -n shortlink` で手元の `localhost:8080` へ転送します。
+
+ここで最も重要なのが `selector` です。
+Service は Pod 名を直接指定していません。
+`app.kubernetes.io/name=shortlink` と `app.kubernetes.io/instance=shortlink` のラベルを持つ Pod を転送先にします。
+
+Kubernetes では、label selector がすべてをつなぎます。
+Deployment は selector で自分が管理する Pod を見つけます。
+Service も selector で転送先 Pod を見つけます。
+Pod が作り直されても、同じラベルが付いていれば Service の転送先に戻ってきます。
+
+### kubectl の基本動詞
+
+Kubernetes を操作する CLI が `kubectl` です。
+今日まず覚える動詞は、一覧を見る `get`、詳細やイベントを見る `describe`、アプリログを見る `logs`、Pod 内でコマンドを実行する `exec` です。
+
+```sh title="kubectl の基本"
+kubectl get deploy,rs,pod,svc -n shortlink
+kubectl describe deployment shortlink -n shortlink
+kubectl describe service shortlink -n shortlink
+kubectl logs -n shortlink -l app.kubernetes.io/name=shortlink --tail=50
+POD_NAME=$(kubectl get pod -n shortlink -l app.kubernetes.io/name=shortlink -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n shortlink "$POD_NAME" -- /bin/sh
+```
+
+最後の `exec` は、Day 5 で扱った distroless イメージに shell がないため失敗します。
+`exec: "/bin/sh": stat /bin/sh: no such file or directory` のようなエラーが出れば、本番用イメージに余計なツールを入れない設計を確認できています。
+
+## 手を動かす
+
+ここからは、実際に検証した流れに沿って進めます。
+最初はリポジトリルートから実行します。
+
+```sh
+kind create cluster --config deploy/kind-config.yaml --name shortlink
+docker build -f deploy/Dockerfile -t shortlink:dev app
+kind load docker-image shortlink:dev --name shortlink
+```
+
+最初のコマンドで kind クラスタを作ります。
+次に shortlink イメージをビルドし、`kind load docker-image` で kind クラスタ内のノードから見えるようにします。
+`Deployment` は `imagePullPolicy: Never` なので、この読み込みを忘れると Pod は `shortlink:dev` を見つけられません。
+
+マニフェストは `deploy/` ディレクトリから適用します。
+
+```sh
+cd deploy
+kubectl apply -f k8s/base
+```
+
+`namespace/shortlink created`、`deployment.apps/shortlink created`、`service/shortlink created` が出れば適用できています。
+
+作成されたリソースを確認します。
+
+```sh
+kubectl get deploy,rs,pod,svc -n shortlink
+```
+
+期待出力の形です。Pod 名の末尾や ClusterIP は環境ごとに変わります。
+
+```txt
+deployment.apps/shortlink          2/2
+pod/shortlink-xxxxxxxxx-aaaaa      1/1   Running
+pod/shortlink-xxxxxxxxx-bbbbb      1/1   Running
+service/shortlink                  ClusterIP   80/TCP
+```
+
+ここで見るべきなのは、Deployment が `2/2`、Pod が 2 つとも `Running` になっていることです。
+これで `replicas: 2` の望ましい状態が満たされています。
+
+ローカルから Service へ接続するため、port-forward を起動します。
+このコマンドは実行中のままにし、別ターミナルで curl します。
+
+```sh
+kubectl port-forward svc/shortlink 8080:80 -n shortlink
+```
+
+```sh
+curl http://localhost:8080/healthz
+```
+
+期待出力です。
+
+```txt
+ok
+```
+
+短縮リンクを作ります。
+
+```sh
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/day09/kubernetes"}'
+```
+
+期待出力の形です。code は `1` 以外になることがあります。
+
+```http
+HTTP/1.1 201 Created
+{"code":"1","short_url":"http://localhost:8080/1"}
+```
+
+以下では code が `1` だったとして進めます。別の code が返った場合は置き換えてください。
+
+リダイレクトを確認します。
+
+```sh
+curl -i http://localhost:8080/1
+```
+
+期待出力です。
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/day09/kubernetes
+```
+
+今日は Pod が 2 つあり、Service がどちらかへ転送します。
+ただし `STORAGE=memory` なので、それぞれの Pod は別々のメモリを持っています。
+短縮リンクを作った Pod と、リダイレクトを受けた Pod が違う場合、`404` になることがあります。
+その場合は数回試すか、今日の主題として「メモリ保存は複数 Pod と相性が悪い」ことを観察してください。
+この問題は Day 11 のステートレス設計でもう一度扱います。
+
+### 自己修復を観察する
+
+次に、Pod を 1 つ削除して自己修復を観察します。
+
+```sh
+kubectl get pod -n shortlink
+POD_NAME=$(kubectl get pod -n shortlink -l app.kubernetes.io/name=shortlink -o jsonpath='{.items[0].metadata.name}')
+echo "$POD_NAME"
+kubectl delete pod -n shortlink "$POD_NAME"
+kubectl get pod -n shortlink -w
+```
+
+期待する流れは、削除した Pod が `Terminating` になり、新しい Pod が `Pending`、`ContainerCreating`、`Running` へ進む形です。
+
+```txt
+shortlink-xxxxxxxxx-aaaaa   1/1   Terminating         0   3m
+shortlink-xxxxxxxxx-ccccc   0/1   Pending             0   1s
+shortlink-xxxxxxxxx-ccccc   0/1   ContainerCreating   0   2s
+shortlink-xxxxxxxxx-ccccc   1/1   Running             0   5s
+```
+
+これは、Kubernetes が「Pod を消されても、Deployment の望ましい状態は 2 個」と判断し、ReplicaSet 経由で新しい Pod を作ったということです。
+手で `docker run` をやり直したのではなく、宣言した状態に戻すコントローラが働いています。
+watch を止めるには `Ctrl-C` を押し、最後にもう一度全体を確認します。
+
+```sh
+kubectl get deploy,rs,pod,svc -n shortlink
+```
+
+Deployment が `2/2`、Pod が 2 つ `Running` なら、自己修復の観察は成功です。
+
+### 片付け
+
+マニフェストだけ消す場合と、kind クラスタごと消す場合のコマンドです。
+
+```sh
+kubectl delete -f k8s/base
+kind delete cluster --name shortlink
+```
+
+## クイズ
+
+<Quiz question="Deployment、ReplicaSet、Pod の関係として正しいものはどれですか？" choices={['Deployment が望ましい状態を宣言し、ReplicaSet が Pod 数を保ち、Pod が実際のコンテナを動かす', 'Pod が Deployment を作り、Deployment が Service を削除する', 'ReplicaSet はログを見るためだけのリソースで、Pod 数には関係しない', 'Deployment は必ず 1 つの Pod しか作れない']} answer={0} explanation="Deployment は更新や望ましい状態の入口です。ReplicaSet は指定された数の Pod を保ち、Pod の中でコンテナが動きます。" />
+
+<Quiz question="Service がトラフィックを向ける Pod を見つける仕組みはどれですか？" choices={['Service の selector と Pod の labels が一致するものを転送先にする', 'Pod 名の末尾が alphabetically 最初のものだけを選ぶ', 'Deployment 名と Service 名が同じなら自動的に全 Pod へ送る', 'containerPort が 8080 なら Namespace に関係なく全部選ぶ']} answer={0} explanation="Service は Pod 名ではなく label selector で転送先を選びます。今日の Service は app.kubernetes.io/name と instance が一致する Pod へ流します。" />
+
+<Quiz question="Kubernetes で宣言的という言葉の意味として最も近いものはどれですか？" choices={['起動手順を 1 行ずつ命令するのではなく、最終的に保ちたい状態を書き、コントローラが実際の状態を近づける', 'すべての Pod に SSH して手作業で設定する', 'コンテナを必ず 1 台のホストだけで動かす', 'YAML にコメントを書いておけば自動でドキュメント化される']} answer={0} explanation="宣言的とは、replicas: 2 のように望ましい状態を書く考え方です。実際の Pod が 1 つに減ると、Kubernetes が差分を埋めて 2 つへ戻します。" />
+
+<Quiz question="kind load docker-image shortlink:dev --name shortlink が必要な理由はどれですか？" choices={['ローカル Docker でビルドしたイメージを kind クラスタ内のノードから見えるようにするため', 'Service の ClusterIP を外部公開するため', 'Pod の replicas を 2 から 1 に変更するため', 'kubectl の context を削除するため']} answer={0} explanation="kind クラスタのノードは Docker コンテナとして動いており、手元の Docker イメージをそのまま参照できるとは限りません。imagePullPolicy: Never と組み合わせるため、kind load で読み込みます。" />
+
+## 今日のまとめ
+
+今日は、kind でローカル Kubernetes クラスタを作り、shortlink を Deployment と Service で動かしました。
+Kubernetes は、複数ホストへの配置、自己修復、宣言的な望ましい状態の維持、Pod が入れ替わっても使える安定した宛先を扱う仕組みです。
+
+Pod はコンテナを動かす最小単位です。
+ReplicaSet は Pod 数を保ちます。
+Deployment は ReplicaSet を通じて Pod の望ましい状態と更新を管理します。
+Service は label selector で Pod を見つけ、安定した宛先を提供します。
+
+今日の一番大事なキーワードは label selector です。
+Deployment も Service も、Pod 名を直接覚えるのではなく、ラベルで対象を見つけます。
+Pod が消えて新しい Pod が生えても、同じラベルが付いていれば管理対象や転送先として扱われます。
+
+実手順では、kind クラスタ作成、Docker イメージのビルド、`kind load docker-image`、`kubectl apply -f k8s/base`、2 つの Pod の Running 確認、port-forward、`curl` での `201` と `302` を確認しました。
+さらに Pod を 1 つ削除し、Deployment の `replicas: 2` に戻るよう新しい Pod が作られる自己修復も観察しました。
+
+## 明日の予告
+
+Day 10 では、Kubernetes 上の設定と運用に進みます。
+ConfigMap で環境変数を外出しし、liveness probe と readiness probe でヘルスチェックを分け、ローリング更新で Pod を安全に入れ替える仕組みを学びます。
+
+今日の Deployment、Service、label selector の理解が、明日の ConfigMap、probe、ローリング更新を読む土台になります。

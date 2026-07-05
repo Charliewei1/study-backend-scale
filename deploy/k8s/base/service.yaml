@@ -1,0 +1,38 @@
+# Service は Pod の入れ替わりに左右されない安定した宛先を作ります。
+apiVersion: v1
+# kind は作成する Kubernetes リソースの種類を表します。
+kind: Service
+# metadata はリソース名、Namespace、ラベルなどの識別情報です。
+metadata:
+  # name は Service の名前です。port-forward では svc/shortlink として参照します。
+  name: shortlink
+  # namespace は、この Service を配置する Namespace です。
+  namespace: shortlink
+  # labels は Service 自体を分類・検索するためのキーと値です。
+  labels:
+    # app.kubernetes.io/name は Kubernetes でよく使われるアプリ名ラベルです。
+    app.kubernetes.io/name: shortlink
+    # app.kubernetes.io/instance は、この Service が対応するデプロイ単位です。
+    app.kubernetes.io/instance: shortlink
+    # app.kubernetes.io/component は、システム内での役割を表します。
+    app.kubernetes.io/component: api
+    # app.kubernetes.io/part-of は、このリソースが属する教材システム名です。
+    app.kubernetes.io/part-of: study-backend-scale
+# spec は Service がどの Pod にどのポートで転送するかの定義です。
+spec:
+  # type: ClusterIP はクラスタ内部向けの仮想 IP を作る最も基本的な Service です。
+  type: ClusterIP
+  # selector は、この Service の転送先 Pod を選ぶ条件です。
+  selector:
+    # selector は転送先 Pod をラベルで探します。Deployment の Pod labels と一致させます。
+    app.kubernetes.io/name: shortlink
+    # instance も一致させることで、同名アプリの別デプロイと混ざらないようにします。
+    app.kubernetes.io/instance: shortlink
+  # ports は Service が受けるポートと Pod 側の転送先ポートの対応です。
+  ports:
+    # name は Service ポートの名前です。
+    - name: http
+      # port は Service がクラスタ内部に公開するポートです。
+      port: 80
+      # targetPort は Pod 側の転送先ポートです。Deployment の containerPort 8080 に合わせます。
+      targetPort: 8080

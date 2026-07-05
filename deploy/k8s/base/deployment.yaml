@@ -1,0 +1,67 @@
+# Deployment は Pod の望ましい状態を宣言し、ReplicaSet 経由で Pod 数を保ちます。
+apiVersion: apps/v1
+# kind は作成する Kubernetes リソースの種類を表します。
+kind: Deployment
+# metadata はリソース名、Namespace、ラベルなどの識別情報です。
+metadata:
+  # name は Deployment の名前です。
+  name: shortlink
+  # namespace は、この Deployment を配置する Namespace です。
+  namespace: shortlink
+  # labels は Deployment 自体を分類・検索するためのキーと値です。
+  labels:
+    # app.kubernetes.io/name は Kubernetes でよく使われるアプリ名ラベルです。
+    app.kubernetes.io/name: shortlink
+    # app.kubernetes.io/instance は、このデプロイ単位を識別するラベルです。
+    app.kubernetes.io/instance: shortlink
+    # app.kubernetes.io/component は、システム内での役割を表します。
+    app.kubernetes.io/component: api
+    # app.kubernetes.io/part-of は、このリソースが属する教材システム名です。
+    app.kubernetes.io/part-of: study-backend-scale
+# spec は Deployment が実現したい望ましい状態です。
+spec:
+  # replicas は起動しておきたい Pod の数です。
+  replicas: 2
+  # selector は Deployment と Pod template を結び付ける条件です。
+  selector:
+    # matchLabels は指定したラベルをすべて持つ Pod を対象にします。
+    matchLabels:
+      # selector は、この Deployment が管理する Pod をラベルで探します。
+      app.kubernetes.io/name: shortlink
+      # Pod template 側の labels と必ず一致させます。
+      app.kubernetes.io/instance: shortlink
+  # template は Deployment が作成する Pod のひな形です。
+  template:
+    # metadata は Pod に付ける識別情報です。
+    metadata:
+      # labels は Deployment や Service が Pod を探すために使います。
+      labels:
+        # Service と Deployment selector が Pod を見つけるためのラベルです。
+        app.kubernetes.io/name: shortlink
+        # Deployment selector と一致させるインスタンス名です。
+        app.kubernetes.io/instance: shortlink
+        # Pod が API コンポーネントであることを示します。
+        app.kubernetes.io/component: api
+        # 教材全体のどのシステムに属するかを示します。
+        app.kubernetes.io/part-of: study-backend-scale
+    # spec は Pod の中で動かすコンテナなどの定義です。
+    spec:
+      # containers は Pod 内で起動するコンテナ一覧です。
+      containers:
+        # name は Pod 内のコンテナ名です。
+        - name: shortlink
+          # image は kind に読み込むローカル Docker イメージ名です。
+          image: shortlink:dev
+          # imagePullPolicy: Never は外部レジストリへ取りに行かず、kind 内のローカルイメージだけを使います。
+          imagePullPolicy: Never
+          # env はコンテナに渡す環境変数です。
+          env:
+            # STORAGE=memory により、Day 9 では外部 DB なしで Pod 構造の学習に集中します。
+            - name: STORAGE
+              value: memory
+          # ports はコンテナが待ち受けるポートを Kubernetes に知らせます。
+          ports:
+            # name は Service などから参照しやすいポート名です。
+            - name: http
+              # containerPort はアプリがコンテナ内で listen するポートです。
+              containerPort: 8080

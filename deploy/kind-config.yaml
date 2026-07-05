@@ -1,0 +1,8 @@
+# apiVersion は kind の設定ファイル形式のバージョンです。
+apiVersion: kind.x-k8s.io/v1alpha4
+# kind は Docker コンテナ上にローカル Kubernetes クラスタを作るツールです。
+kind: Cluster
+# nodes はクラスタを構成するノード一覧です。教材では理解しやすい 1 ノード構成にします。
+nodes:
+  # control-plane は Kubernetes API server などを動かす管理ノードです。
+  - role: control-plane

@@ -1,0 +1,14 @@
+# Namespace は Kubernetes クラスタ内のリソースを論理的に分ける単位です。
+apiVersion: v1
+# kind は作成する Kubernetes リソースの種類を表します。
+kind: Namespace
+# metadata はリソース名やラベルなどの識別情報です。
+metadata:
+  # name は Namespace の名前です。以降のリソースはこの Namespace に配置します。
+  name: shortlink
+  # labels はリソースを分類・検索するためのキーと値です。
+  labels:
+    # app.kubernetes.io/name は Kubernetes でよく使われるアプリ名ラベルです。
+    app.kubernetes.io/name: shortlink
+    # app.kubernetes.io/part-of は、この Namespace が属する教材システム名です。
+    app.kubernetes.io/part-of: study-backend-scale
