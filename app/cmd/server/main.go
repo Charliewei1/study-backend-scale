@@ -11,7 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/study-backend-scale/shortlink/internal/analytics"
+	"github.com/study-backend-scale/shortlink/internal/cache"
 	"github.com/study-backend-scale/shortlink/internal/handler"
 	"github.com/study-backend-scale/shortlink/internal/shortener"
 	"github.com/study-backend-scale/shortlink/internal/storage"
@@ -28,10 +30,14 @@ func main() {
 	store, closeStore := newStore()
 	defer closeStore()
 
+	var cacheStats cache.StatsProvider
+	store, closeCache, cacheStats := withRedisCache(store)
+	defer closeCache()
+
 	clicks := analytics.New(store, 1024)
 
 	baseURL := fmt.Sprintf("http://localhost:%s", port)
-	h := handler.New(shortener.New(), store, baseURL, clicks)
+	h := handler.New(shortener.New(), store, baseURL, clicks, cacheStats)
 
 	addr := ":" + port
 	server := &http.Server{
@@ -79,6 +85,28 @@ func main() {
 		log.Printf("flush analytics: %v", err)
 	}
 	cancel()
+}
+
+func withRedisCache(store storage.Storage) (storage.Storage, func(), cache.StatsProvider) {
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		return store, func() {}, nil
+	}
+
+	client := redis.NewClient(&redis.Options{
+		Addr:         redisAddr,
+		DialTimeout:  200 * time.Millisecond,
+		ReadTimeout:  200 * time.Millisecond,
+		WriteTimeout: 200 * time.Millisecond,
+	})
+	cached := cache.NewRedisStore(store, client)
+	log.Printf("redis cache enabled at %s", redisAddr)
+
+	return cached, func() {
+		if err := client.Close(); err != nil {
+			log.Printf("close redis client: %v", err)
+		}
+	}, cached
 }
 
 func newDebugServer() *http.Server {

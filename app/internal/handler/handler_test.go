@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/study-backend-scale/shortlink/internal/analytics"
+	"github.com/study-backend-scale/shortlink/internal/cache"
 	"github.com/study-backend-scale/shortlink/internal/shortener"
 	"github.com/study-backend-scale/shortlink/internal/storage"
 )
@@ -301,6 +302,43 @@ func TestHealthz(t *testing.T) {
 	if got := rec.Body.String(); got != "ok" {
 		t.Fatalf("body = %q, want ok", got)
 	}
+}
+
+func TestCacheStats(t *testing.T) {
+	store := storage.NewMemoryStore()
+	h := New(shortener.New(), store, testBaseURL, nil, fakeCacheStats{
+		stats: cache.Stats{
+			Hits:   7,
+			Misses: 3,
+		},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/api/cache/stats", nil)
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+
+	var got cache.Stats
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response body is not JSON: %v; body=%s", err, rec.Body.String())
+	}
+	if got.Hits != 7 || got.Misses != 3 {
+		t.Fatalf("cache stats = %+v, want hits=7 misses=3", got)
+	}
+}
+
+type fakeCacheStats struct {
+	stats cache.Stats
+}
+
+func (s fakeCacheStats) Stats() cache.Stats {
+	return s.stats
 }
 
 func assertJSONBody(t *testing.T, body string, want map[string]string) {

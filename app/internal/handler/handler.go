@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/study-backend-scale/shortlink/internal/cache"
 	"github.com/study-backend-scale/shortlink/internal/shortener"
 	"github.com/study-backend-scale/shortlink/internal/storage"
 )
@@ -18,6 +19,7 @@ type Handler struct {
 	store     storage.Storage
 	baseURL   string
 	clicks    clickRecorder
+	cache     cache.StatsProvider
 }
 
 type clickRecorder interface {
@@ -26,16 +28,20 @@ type clickRecorder interface {
 
 // New は Go 1.22 で追加された ServeMux の "METHOD /path" パターンを使って
 // ルーティングを登録します。
-func New(shortener *shortener.Shortener, store storage.Storage, baseURL string, clicks clickRecorder) http.Handler {
+func New(shortener *shortener.Shortener, store storage.Storage, baseURL string, clicks clickRecorder, cacheStats ...cache.StatsProvider) http.Handler {
 	h := &Handler{
 		shortener: shortener,
 		store:     store,
 		baseURL:   strings.TrimRight(baseURL, "/"),
 		clicks:    clicks,
 	}
+	if len(cacheStats) > 0 {
+		h.cache = cacheStats[0]
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
+	mux.HandleFunc("GET /api/cache/stats", h.getCacheStats)
 	mux.HandleFunc("POST /api/links", h.createLink)
 	mux.HandleFunc("GET /api/links/{code}/stats", h.getLinkStats)
 	mux.HandleFunc("GET /api/links/{code}", h.getLink)
@@ -71,6 +77,15 @@ type errorResponse struct {
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok"))
+}
+
+func (h *Handler) getCacheStats(w http.ResponseWriter, r *http.Request) {
+	if h.cache == nil {
+		writeJSON(w, http.StatusOK, cache.Stats{})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, h.cache.Stats())
 }
 
 func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {

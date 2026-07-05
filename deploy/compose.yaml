@@ -10,8 +10,11 @@ services:
     environment:
       STORAGE: postgres
       DATABASE_URL: postgres://shortlink:shortlink@postgres:5432/shortlink?sslmode=disable
+      REDIS_ADDR: redis:6379
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   postgres:
@@ -24,6 +27,15 @@ services:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U shortlink -d shortlink"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10

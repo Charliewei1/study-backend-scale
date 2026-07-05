@@ -1,0 +1,398 @@
+---
+title: "Day 8 - Redis キャッシュ: 読み取りを速くする"
+description: URL 短縮サービスに Redis の cache-aside を追加し、読み取りが多いワークロード、TTL、フォールバック、ヒット率、k6 での比較を学びます。
+sidebar:
+  label: Day 8
+  order: 8
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+## 今日のゴール
+
+- URL 短縮サービスが read-heavy なワークロードになりやすい理由を説明できるようになる。
+- cache-aside パターンの読み取りフローを、ヒット、ミス、保存の順で説明できるようになる。
+- Day 3 の `Storage` インターフェースが、Redis デコレータで効いていることを理解する。
+- TTL とキャッシュ無効化の難しさを説明できるようになる。
+- Redis が落ちても Postgres へフォールバックして `302` を返す設計を読めるようになる。
+- `GET /api/cache/stats` の `{"hits":N,"misses":M}` でキャッシュの効き具合を観察できるようになる。
+- Day 7 と同じ負荷で、キャッシュ導入前後の実測値を比較できるようになる。
+
+## 解説
+
+Day 7 では、Compose + Postgres 構成に k6 で負荷をかけました。
+今日の出発点は、そのベースラインです。
+
+URL 短縮サービスは、キャッシュと相性が良い題材です。
+短縮 URL は一度作られると、そのあと何度もクリックされます。
+作成よりリダイレクトのほうが多く、実サービスでは読み取りと書き込みの比率が 100:1 くらいに偏ることもあります。
+
+このような read-heavy なサービスでは、毎回 Postgres に問い合わせるより、よく読まれる `code -> URL` を Redis に置くことで読み取りの待ち時間を減らせます。
+ただし、キャッシュは魔法ではありません。
+同じデータが繰り返し読まれないワークロードでは、Redis を挟む分だけ遅くなることもあります。
+
+### リダイレクトのどこを速くするか
+
+リダイレクトでは、`app/internal/handler/handler.go` の `redirect` が `h.store.Load` で code から URL を読み、`302 Found` を返します。
+
+ここでハンドラは、保存先が Postgres 単体なのか Redis 付きなのかを知りません。
+ただ `storage.Storage` を呼んでいます。
+
+```go title="app/internal/storage/storage.go"
+type Storage interface {
+	Save(ctx context.Context, code, url string) error
+	Load(ctx context.Context, code string) (string, error)
+	Get(ctx context.Context, code string) (Link, error)
+	IncrementClicks(ctx context.Context, code string) error
+}
+```
+
+Day 3 でこのインターフェースを切ったことが、今日効いてきます。
+Day 6 では Postgres を差し込みました。
+Day 8 では、Postgres の前に Redis キャッシュをかぶせます。
+
+このように、既存の部品と同じインターフェースを満たしつつ、前後に処理を足す形をデコレータと呼びます。
+ハンドラを変えずに機能を足せるので、責務がきれいに分かれます。
+
+### cache-aside パターン
+
+今日の実装は cache-aside です。
+データの本体は Postgres に置き、Redis は横に置いた高速な読み取り用コピーとして使います。
+
+読み取りの流れは次の通りです。
+
+1. `GET /{code}` が来る。
+2. Redis に `shortlink:url:{code}` があるか見る。
+3. あれば、それを使って `302` を返す。これがキャッシュヒットです。
+4. なければ、Postgres から読む。これがキャッシュミスです。
+5. Postgres で見つかった URL を Redis に TTL 付きで保存する。
+6. 今回のリクエストは Postgres の値で `302` を返す。
+7. 次回以降、同じ code は Redis から読める。
+
+実コードでは、`RedisStore` が `storage.Storage` を包んでいます。
+
+```go title="app/internal/cache/redis.go"
+type RedisStore struct {
+	next   storage.Storage
+	client redisClient
+	ttl    time.Duration
+	hits   atomic.Uint64
+	misses atomic.Uint64
+}
+```
+
+`Load` が cache-aside の中心です。
+まず Redis を読み、成功したら hit を増やして返します。
+Redis にない場合や Redis が失敗した場合は、miss を増やして保存先へ進みます。
+
+```go title="app/internal/cache/redis.go"
+if url, err := s.client.Get(ctx, key); err == nil {
+	s.hits.Add(1)
+	return url, nil
+} else {
+	s.misses.Add(1)
+	if !errors.Is(err, redis.Nil) {
+		log.Printf("redis get %q failed; falling back to storage: %v", code, err)
+	}
+}
+
+url, err := s.next.Load(ctx, code)
+if err != nil {
+	return "", err
+}
+if err := s.client.SetEX(ctx, key, url, s.ttl); err != nil {
+	log.Printf("redis set %q failed: %v", code, err)
+}
+```
+
+重要なのは、Redis のエラーをユーザーへ返していないことです。
+Redis が落ちても、Postgres から読めるなら `302` を返します。
+キャッシュは正しさの本体ではなく、速くするための補助です。
+
+### 書き込みと TTL
+
+今日の実装では、`app/internal/cache/redis.go` の `Save` は Redis に書かず、そのまま `next.Save` へ委譲します。
+短縮 URL は作成後、最初に読まれたタイミングで Redis に入ります。
+
+Redis に入れる値には TTL が付きます。
+TTL は Time To Live、有効期限です。
+`app/internal/cache/redis.go` では、`defaultTTL` が 24 時間、キーの prefix が `shortlink:url:` です。
+
+TTL があると、古い値や使われない値が永遠に Redis に残りません。
+Redis のメモリ使用量を抑え、もし古い値が入っても時間が経てば消えるという安全弁になります。
+
+ただし、TTL は万能ではありません。
+TTL が 24 時間なら、最悪 24 時間は古い値が読まれる可能性があります。
+TTL を短くすると鮮度は上がりますが、キャッシュミスが増えて Postgres への問い合わせも増えます。
+
+もし将来「短縮 URL のリンク先を変更できる」機能を入れたら、Postgres 更新時に Redis の古い値をどう消すかを考える必要があります。
+消し忘れると古い URL へ飛ばされます。
+先に Redis を消してから DB 更新に失敗すると、別の不整合が起きます。
+
+「キャッシュ無効化は計算機科学の二大難問」という言い回しがあります。
+キャッシュは読むだけなら簡単に見えますが、難しいのはデータが変わった瞬間に、どのコピーを、いつ、誰が、どの順で消すかです。
+
+### Redis を有効にする組み立て
+
+Redis は `REDIS_ADDR` が設定されているときだけ有効になります。
+設定がなければ、キャッシュなしで保存先をそのまま使います。
+
+```go title="app/cmd/server/main.go"
+redisAddr := os.Getenv("REDIS_ADDR")
+if redisAddr == "" {
+	return store, func() {}, nil
+}
+client := redis.NewClient(&redis.Options{
+	Addr: redisAddr, DialTimeout: 200 * time.Millisecond,
+	ReadTimeout: 200 * time.Millisecond, WriteTimeout: 200 * time.Millisecond,
+})
+cached := cache.NewRedisStore(store, client)
+```
+
+タイムアウトが 200ms に設定されている点も大事です。
+Redis が落ちているときに長く待つと、キャッシュの障害がアプリ全体の遅さになります。
+短く諦め、Postgres にフォールバックします。
+
+Compose では、app、postgres、redis の 3 サービスが起動します。
+`deploy/compose.yaml` の app は `STORAGE=postgres`、`DATABASE_URL=...@postgres:5432/...`、`REDIS_ADDR=redis:6379` を受け取り、Redis の healthcheck を待って起動します。
+アプリから見る Redis の宛先は `localhost` ではなく、Compose ネットワーク上のサービス名 `redis` です。
+
+### ヒット率を観察する
+
+キャッシュは、入れただけでは効いているか分かりません。
+今日の実装では hit と miss を数え、`GET /api/cache/stats` で見られるようにしています。
+
+`app/internal/cache/redis.go` の `Stats` は `Hits` と `Misses` を持ち、JSON では `hits` と `misses` として返ります。
+`app/internal/handler/handler.go` の `getCacheStats` は、キャッシュが無効なら `{"hits":0,"misses":0}`、有効なら `h.cache.Stats()` を JSON で返します。
+
+最初のアクセスは miss です。
+そのあと Redis に保存されるので、同じ code の 2 回目は hit になります。
+この「1 回目は miss、2 回目は hit」を今日の手順で確認します。
+
+テストでも、ミス時に保存先へフォールバックし、2 回目は保存先を読まないことを確認しています。
+Redis が失敗した場合も、`Load` は Redis のエラーを返さず、保存先から URL を返します。
+この設計を graceful fallback と呼びます。
+
+### 今日の実測値
+
+Day 7 と Day 8 は、同じ Compose 構成、同じ 2 分間の `ramping-vus`、同じ 90% redirect / 10% create の負荷で比較します。
+実サービスでは読み取りが 100:1 くらいに偏ることがありますが、ここでは Day 7 と条件をそろえるため、負荷スクリプトは同じ比率にしています。
+
+`load/day08-cached.js` は Day 7 と同じく、30 秒で 20 VU、1 分で 50 VU、30 秒で 0 VU に戻す `ramping-vus` です。
+threshold も同じで、p95 は 100ms 未満、HTTP 失敗率は 1% 未満を期待します。
+
+このリポジトリでの本物の計測結果は次の通りです。
+
+| 条件 | req/s | エラー率 | avg | p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Day 7 ベースライン | 約 27 req/s | 0% | 1.76ms | 3.04ms |
+| Day 8 キャッシュあり | 約 27 req/s | 0% | 1.56ms | 2.86ms |
+
+Day 7 から Day 8 で、平均は 1.76ms から 1.56ms、p95 は 3.04ms から 2.86ms へ下がりました。
+p95 では約 6% の改善です。
+
+正直に言うと、差は小さいです。
+ローカルの Postgres は速すぎるので、Redis が短縮できる余地が小さいからです。
+キャッシュが本領を発揮するのは、DB がネットワークの向こうにあり、データ量が増え、同じ短縮 URL が高頻度で読まれ、DB の CPU、I/O、接続数が詰まり始めるときです。
+
+それでも、このローカル環境でも p95 が約 6% 改善しました。
+「Redis を入れれば常に劇的に速い」ではなく、「読み取りが多く、同じキーが繰り返し読まれ、DB アクセスが相対的に重いときに効く。効果は計測して判断する」と考えましょう。
+
+キャッシュを入れる判断軸は、ヒット率、DB 負荷、読み書き比率、データ鮮度の要求、Redis 障害時のフォールバックです。
+毎回違うデータを読むワークロードや、書き込み直後の強い整合性が必要な処理では、慎重に設計する必要があります。
+
+## 手を動かす
+
+まず Compose で app、Postgres、Redis を起動します。
+
+```sh
+cd deploy
+docker compose up -d --build
+```
+
+ヘルスチェックで、アプリが起動していることを確認します。
+
+```sh
+curl http://localhost:8080/healthz
+```
+
+期待出力です。
+
+```txt
+ok
+```
+
+短縮リンクを作ります。
+
+```sh
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/day08/cache-aside"}'
+```
+
+期待出力は次の形です。
+既存データが残っている場合、code は `1` 以外になることがあります。
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: http://localhost:8080/1
+
+{"code":"1","short_url":"http://localhost:8080/1"}
+```
+
+以下では code が `1` だったとして進めます。
+別の code が返った場合は、コマンド中の `1` を置き換えてください。
+
+1 回目のリダイレクトを確認します。
+
+```sh
+curl -i http://localhost:8080/1
+```
+
+期待出力です。
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/day08/cache-aside
+```
+
+この 1 回目は Redis にまだないので miss です。
+
+```sh
+curl http://localhost:8080/api/cache/stats
+```
+
+期待出力です。
+
+```json
+{"hits":0,"misses":1}
+```
+
+同じ code にもう一度アクセスします。
+
+```sh
+curl -i http://localhost:8080/1
+```
+
+期待出力は同じ `302` です。
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/day08/cache-aside
+```
+
+2 回目は Redis から読めるので hit になります。
+
+```sh
+curl http://localhost:8080/api/cache/stats
+```
+
+期待出力です。
+
+```json
+{"hits":1,"misses":1}
+```
+
+次に、Redis だけを止めます。
+app と Postgres は動かしたままです。
+
+```sh
+docker compose stop redis
+```
+
+Redis が止まっていても、リダイレクトが返ることを確認します。
+
+```sh
+curl -i http://localhost:8080/1
+```
+
+期待出力です。
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/day08/cache-aside
+```
+
+Redis は落ちていますが、Postgres には保存されています。
+アプリは Redis の失敗をログに出し、Postgres へフォールバックして `302` を返します。
+
+Redis を戻します。
+
+```sh
+docker compose start redis
+```
+
+最後に k6 で Day 8 の負荷試験を実行します。
+リポジトリルートへ戻ってから実行します。
+
+```sh
+cd ..
+k6 run load/day08-cached.js
+```
+
+見るべき出力は、失敗率、平均、p95、req/s です。
+
+```txt
+http_req_failed................: 0.00%
+http_req_duration..............: avg=1.56ms p(95)=2.86ms
+http_reqs......................: ... 27/s
+```
+
+Day 7 のベースラインは次の値でした。
+
+```txt
+http_req_failed................: 0.00%
+http_req_duration..............: avg=1.76ms p(95)=3.04ms
+http_reqs......................: ... 27/s
+```
+
+同じ 27 req/s、エラー 0% のまま、p95 が 3.04ms から 2.86ms へ下がっています。
+大きな差ではありませんが、ローカル Postgres が速い条件でも p95 は約 6% 改善しました。
+
+確認が終わったら、片付けます。
+
+```sh
+cd deploy
+docker compose down -v
+```
+
+## クイズ
+
+<Quiz question="cache-aside の読み取りフローとして正しいものはどれですか？" choices={['まず Redis を読み、ヒットすれば返す。ミスなら DB から読み、Redis に保存して返す', '必ず DB を先に読み、その後 Redis の値で上書きする', '書き込み時だけ Redis を使い、読み取り時は Redis を見ない', 'Redis にない場合は 404 を返し、DB には問い合わせない']} answer={0} explanation="cache-aside では、アプリが Redis を先に見ます。ミスしたときだけ DB を読み、取得できた値を Redis に保存して次回の読み取りを速くします。" />
+
+<Quiz question="TTL の役割として最も適切なものはどれですか？" choices={['キャッシュの有効期限を決め、古い値や不要な値が永遠に残らないようにする', 'Redis が落ちたときに Postgres を自動で再起動する', 'HTTP のステータスコードを 302 から 200 に変える', 'すべてのキャッシュ無効化問題を完全に解決する']} answer={0} explanation="TTL はキャッシュの有効期限です。メモリ使用量や古い値の残留を抑える安全弁になります。ただし、更新直後の古い値問題を完全に消すわけではありません。" />
+
+<Quiz question="キャッシュが効きにくいワークロードはどれですか？" choices={['同じ短縮 URL が何度もクリックされる', '毎回ほぼ違うキーを読み、再利用されるデータが少ない', '読み取りが書き込みより圧倒的に多い', 'DB への読み取りがレイテンシの主要因になっている']} answer={1} explanation="キャッシュは同じデータが繰り返し読まれるときに効きます。毎回違うキーばかり読む場合はヒット率が低く、Redis を挟むオーバーヘッドだけが増える可能性があります。" />
+
+<Quiz question="Redis がダウンしたときの今日の実装の正しい挙動はどれですか？" choices={['Redis エラーをログに出し、Postgres にフォールバックして、保存済みリンクなら 302 を返す', 'Redis が落ちたらすべてのリクエストを 500 にする', 'Redis が復旧するまで HTTP サーバを停止する', 'Redis に残っている古い値だけで応答し、Postgres は見ない']} answer={0} explanation="Redis は補助的なキャッシュです。今日の RedisStore は Redis の失敗をログに出しますが、本体の storage にフォールバックするため、Postgres が生きていれば 302 を返せます。" />
+
+## 今日のまとめ
+
+今日は、URL 短縮サービスに Redis キャッシュを追加しました。
+短縮 URL は、作成よりクリックのほうが多い read-heavy なサービスです。
+読み取りと書き込みが 100:1 くらいに偏ることがあるため、`code -> URL` の読み取りを Redis に逃がす価値があります。
+
+実装は cache-aside です。
+まず Redis を読み、ヒットすればその値で `302` を返します。
+ミスしたら Postgres から読み、Redis に TTL 付きで保存し、今回のレスポンスも返します。
+
+Day 3 の `Storage` インターフェースは、今日の Redis デコレータで回収されました。
+ハンドラは `h.store.Load` を呼ぶだけで、裏側が Postgres 単体なのか Redis 付きなのかを知りません。
+この小さな設計の積み重ねが、後日のスケール対応を楽にします。
+
+このリポジトリでの実測では、Day 7 ベースラインが p95 3.04ms、avg 1.76ms、Day 8 キャッシュあり が p95 2.86ms、avg 1.56ms でした。
+どちらも約 27 req/s、エラー 0% です。
+ローカルの Postgres は速すぎるので差は小さいですが、それでも p95 は約 6% 改善しました。
+
+キャッシュを入れるべきかは、ヒット率、DB 負荷、読み書き比率、データ鮮度の要求、障害時のフォールバックで判断します。
+「速そうだから Redis」ではなく、測って、効く場所に入れるのが今日の結論です。
+
+## 明日の予告
+
+Day 9 では、Kubernetes 入門に進みます。
+これまでは Docker Compose で app、Postgres、Redis を同じ開発環境に並べてきました。
+明日は kind を使い、Pod、Deployment、Service の関係を学びます。
+
+アプリを 1 プロセスとして動かす段階から、複数のコンテナを宣言的に管理する段階へ進みます。
+Day 8 の Redis や Day 6 の Postgres の知識も、Kubernetes 上で「どの部品をどう接続するか」を考える土台になります。
