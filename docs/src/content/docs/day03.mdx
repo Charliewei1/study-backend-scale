@@ -1,0 +1,360 @@
+---
+title: Day 3 - 永続化とインターフェース設計
+description: Storage インターフェース、SQLite 永続化、database/sql、context.Context、errors.Is を通じて、保存先を差し替えられる Go の設計を学びます。
+sidebar:
+  label: Day 3
+  order: 3
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+## 今日のゴール
+
+- 保存先を `Storage` インターフェースとして切り出す理由を説明できるようになる。
+- Go のインターフェースが、明示的な `implements` なしで暗黙的に満たされることを理解する。
+- `MemoryStore` と `SQLiteStore` を、同じハンドラから差し替えて使う流れを読めるようになる。
+- `database/sql` の `*sql.DB` が単一接続ではなくコネクションプールであることを理解する。
+- `modernc.org/sqlite` を使う理由として、cgo 不要で扱いやすいことを説明できるようになる。
+- `context.Context` を HTTP リクエストから storage 層へ伝播する意味を理解する。
+- `ErrNotFound` のようなセンチネルエラーと `errors.Is` の使い方に慣れる。
+- `STORAGE=sqlite` で起動し、再起動後も短縮リンクが残ることを確認する。
+
+## 解説
+
+Day 1 では、短縮コードと URL の対応を `map[string]string` に保存しました。
+Day 2 では、API のエラー形式とテストを整えました。
+Day 3 では、いよいよ保存先を永続化します。
+
+永続化とは、プロセスが止まってもデータが残るようにすることです。
+メモリ保存は速くて単純ですが、サーバを再起動すると中身が消えます。
+URL 短縮サービスでは、作った短縮 URL が再起動後に使えなくなるのは困ります。
+
+今日の実装では、SQLite ファイルへ保存できる `SQLiteStore` を追加しています。
+ただし、単に SQLite のコードをハンドラへ直接書き込むのではありません。
+まず `Storage` インターフェースを作り、ハンドラが具体的な保存先に依存しすぎない形へ変えています。
+
+### なぜ Storage インターフェースを切るのか
+
+Day 2 までのハンドラは、保存先として `MemoryStore` を直接受け取っていました。
+これは小さいうちは分かりやすい設計です。
+しかし、保存先が SQLite、Postgres、Redis と増えていくと、ハンドラが具体的な実装を知りすぎると変更しづらくなります。
+
+そこで Day 3 では、ハンドラが必要とする操作だけを `Storage` インターフェースにまとめます。
+
+```go title="app/internal/storage/storage.go"
+type Storage interface {
+	Save(ctx context.Context, code, url string) error
+	Load(ctx context.Context, code string) (string, error)
+	Get(ctx context.Context, code string) (Link, error)
+}
+```
+
+ハンドラが知りたいことは、「保存できるか」「コードから URL を読めるか」「メタ情報を取れるか」です。
+それができるなら、裏側が `map` でも SQLite でも構いません。
+この考え方を依存性の注入と呼びます。
+
+依存性の注入は、部品を中で直接作らず、外から渡す設計です。
+実コードでも `handler.New(shortener *shortener.Shortener, store storage.Storage, baseURL string)` という形で、保存先を外から受け取っています。
+この形にしておくと、テストでは軽い `MemoryStore` を渡せます。
+ローカルで永続化を見たいときは `SQLiteStore` を渡せます。
+Day 6 で Postgres に進むときも、ハンドラの主な関心は変えずに保存先を増やせます。
+
+さらに後日、Redis キャッシュを足すときにもこの考え方が効いてきます。
+HTTP の入口、保存、キャッシュ、分析を分けておくと、1 つの部品を差し替えても全体を壊しにくくなります。
+
+### Go のインターフェースは暗黙的に満たす
+
+Go には、Java や TypeScript のように `implements Storage` と書く場所がありません。
+ある型が `Storage` に必要なメソッドをすべて持っていれば、その型は自動的に `Storage` として扱えます。
+これを暗黙的実装と呼びます。
+
+`MemoryStore` は、次の 3 つのメソッドを持っています。
+
+```go title="app/internal/storage/memory.go"
+func (s *MemoryStore) Save(ctx context.Context, code, url string) error
+func (s *MemoryStore) Load(ctx context.Context, code string) (string, error)
+func (s *MemoryStore) Get(ctx context.Context, code string) (Link, error)
+```
+
+`SQLiteStore` も同じ 3 つのメソッドを持っています。
+
+```go title="app/internal/storage/sqlite.go"
+func (s *SQLiteStore) Save(ctx context.Context, code, url string) error
+func (s *SQLiteStore) Load(ctx context.Context, code string) (string, error)
+func (s *SQLiteStore) Get(ctx context.Context, code string) (Link, error)
+```
+
+そのため、どちらも `storage.Storage` として `handler.New` に渡せます。
+インターフェースは「この型です」と名乗る仕組みではなく、「この操作ができます」と約束する仕組みです。
+
+この性質は、テストでも便利です。
+本物の SQLite ファイルを使わずに、テスト用の保存先を渡すことができます。
+Day 2 からあるハンドラテストは、いまも `storage.NewMemoryStore()` を `handler.New` に渡しています。
+ハンドラは `storage.Storage` だけを要求します。
+`MemoryStore` がそのメソッドを満たすので、そのまま渡せます。
+これが、インターフェースを小さく切る大きな利点です。
+
+### ErrNotFound とセンチネルエラー
+
+Day 3 では、見つからないことを `ErrNotFound` で表すようにしています。
+
+```go title="app/internal/storage/storage.go"
+var ErrNotFound = errors.New("link not found")
+```
+
+このように、パッケージで定義して比較対象にするエラーをセンチネルエラーと呼びます。
+`MemoryStore` は、コードが見つからないときにこのエラーを返します。
+
+SQLite では、`database/sql` が行なしを `sql.ErrNoRows` として返します。
+しかし、ハンドラに `sql.ErrNoRows` を直接知らせると、ハンドラが SQLite や `database/sql` の事情を知ることになります。
+そこで storage 層で `ErrNotFound` へ変換します。
+
+```go title="app/internal/storage/sqlite.go"
+if err := s.db.QueryRowContext(ctx, query, code).Scan(&link.Code, &link.URL); err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
+		return Link{}, ErrNotFound
+	}
+	return Link{}, fmt.Errorf("get link: %w", err)
+}
+```
+
+ハンドラ側は、保存先がメモリか SQLite かを気にせず `writeStorageError` の中で `errors.Is(err, storage.ErrNotFound)` と判定します。
+`errors.Is` を使う理由は、エラーがラップされても判定できるからです。
+Go では、原因を残したまま文脈を足すために `fmt.Errorf("...: %w", err)` をよく使います。
+単純な `err == storage.ErrNotFound` だと、ラップされたエラーを見逃します。
+そのため、外側の層で種類を判定するときは `errors.Is` を使うのが安全です。
+
+### context.Context を第一引数で受け取る
+
+`Storage` の各メソッドは、`Save(ctx context.Context, ...)` のように第一引数に `context.Context` を受け取ります。
+Go では、キャンセルやタイムアウトを伝える必要がある関数では、`context.Context` を第一引数に置くのが慣習です。
+HTTP リクエストにも context が付いています。
+クライアントが接続を切ったり、サーバ側でタイムアウトを設定したりすると、その情報を `r.Context()` から下の層へ渡せます。
+
+ハンドラでは、保存や取得に `r.Context()` を渡しています。
+メモリ保存はとても速いのでキャンセルが目に見えることは少ないですが、`MemoryStore` も `ctx.Err()` を確認しています。
+SQLite 側では、`ExecContext` や `QueryRowContext` に context を渡しています。
+
+今後 Postgres や Redis のようなネットワーク越しの保存先へ進むと、context の重要性はさらに上がります。
+リクエストがすでにキャンセルされているのに、データベース処理だけが残り続けるのは避けたいからです。
+
+### database/sql とコネクションプール
+
+SQLite 実装は、標準ライブラリの `database/sql` を使っています。
+
+```go title="app/internal/storage/sqlite.go"
+type SQLiteStore struct {
+	db *sql.DB
+}
+```
+
+ここで大事なのは、`*sql.DB` は 1 本のデータベース接続そのものではない、という点です。
+`*sql.DB` は、必要に応じて接続を開き、使い終わった接続を再利用するコネクションプールです。
+
+HTTP サーバでは、複数のリクエストが同時に来ます。
+そのたびに接続を作って捨てると、遅くなり、リソースも無駄になります。
+`database/sql` は、接続の再利用や待ち合わせを管理する共通の仕組みを提供します。
+
+SQLite の初期化では、`sql.Open("sqlite", path)` で `*sql.DB` を作り、続けて `CREATE TABLE IF NOT EXISTS links (...)` を `ExecContext` で実行します。
+`links` テーブルでは、`code` が主キーです。
+同じコードを 2 回保存した場合は、`Save` の `ON CONFLICT` によって URL が更新されます。
+
+```go title="app/internal/storage/sqlite.go"
+const query = `
+INSERT INTO links (code, url)
+VALUES (?, ?)
+ON CONFLICT(code) DO UPDATE SET url = excluded.url;`
+```
+
+Day 3 時点では、短縮コード生成器のカウンタはまだメモリ上にあります。
+そのため、サーバ再起動後に新しいリンクを作ると、また `"1"` から採番されます。
+今回の手順では「作ったリンクが再起動後も読めること」を確認します。
+複数台構成でも安全な ID 採番は、Day 11 でランダム base62 へ進むときに扱います。
+
+### modernc.org/sqlite を選んだ理由
+
+Go で SQLite を使うドライバはいくつかあります。
+この教材では `modernc.org/sqlite` を `_ "modernc.org/sqlite"` として import しています。
+先頭の `_` は、パッケージを直接名前で呼ばないけれど、初期化処理だけを使う import です。
+SQLite ドライバは、この初期化処理で `database/sql` に `"sqlite"` というドライバ名を登録します。
+そのため、あとで `sql.Open("sqlite", path)` と書けます。
+
+`modernc.org/sqlite` を選んでいる主な理由は、cgo が不要なことです。
+cgo は Go から C のコードを呼ぶ仕組みで、強力ですが、ビルド環境やクロスコンパイルが複雑になりやすい面があります。
+この教材では、Day 5 以降に Docker や Kubernetes へ進みます。
+その前段階では、できるだけ Go のビルド体験を単純にしておきたいので、pure Go で使える SQLite ドライバを選んでいます。
+
+もちろん、本番の大規模構成で SQLite を共有データベースとして使うわけではありません。
+SQLite は、ローカル開発や小さな単体プロセスではとても扱いやすい選択です。
+Day 6 では、ネットワーク越しに複数プロセスから使える Postgres へ進みます。
+
+### 起動時に保存先を切り替える
+
+保存先の切り替えは `cmd/server/main.go` にあります。
+`STORAGE` 環境変数が空、または `memory` ならメモリ保存です。
+`sqlite` なら SQLite 保存です。
+
+```go title="app/cmd/server/main.go"
+switch os.Getenv("STORAGE") {
+case "", "memory":
+	return storage.NewMemoryStore(), func() {}
+case "sqlite":
+	path := os.Getenv("SQLITE_PATH")
+	if path == "" {
+		path = "data.db"
+	}
+	store, err := storage.NewSQLiteStore(context.Background(), path)
+	// エラー処理と Close は実コードで行っています。
+}
+```
+
+`newStore` は、`storage.Storage` と終了時のクリーンアップ関数を返します。
+メモリ保存では閉じるものがないので、空の関数を返します。
+SQLite 保存では、最後に `store.Close()` して `*sql.DB` の接続プールを閉じます。
+
+`main` は、返ってきた保存先を `handler.New(shortener.New(), store, baseURL)` に渡すだけです。
+このように、アプリの入口で具体的な実装を選び、内側のハンドラはインターフェースだけを見る形にしておくと、変更点を狭くできます。
+
+SQLite 実装のテストでは、`t.TempDir()` でテストごとの一時 DB を作り、`t.Cleanup` で `store.Close()` を呼んでいます。
+また、見つからないケースは `errors.Is(err, ErrNotFound)` で確認しています。
+テストが見ているのは SQLite 内部の `sql.ErrNoRows` ではなく、storage パッケージが外へ出す契約です。
+
+## 手を動かす
+
+ここでは、SQLite 保存に切り替えて、再起動後もリダイレクトが生きていることを確認します。
+ターミナルを 2 つ使います。
+1 つ目でサーバを起動し、2 つ目で `curl` を実行します。
+
+まず、古い確認用 DB があれば消してから起動します。
+
+```sh
+cd app
+rm -f /tmp/shortlink-day03.db
+STORAGE=sqlite SQLITE_PATH=/tmp/shortlink-day03.db go run ./cmd/server
+```
+
+期待するログは次の形です。
+
+```txt
+shortlink server listening on :8080
+```
+
+別のターミナルで、短縮リンクを作ります。
+
+```sh
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/articles/sqlite"}'
+```
+
+新しい DB で最初の作成なら、期待出力は次の形です。
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: http://localhost:8080/1
+
+{"code":"1","short_url":"http://localhost:8080/1"}
+```
+
+念のため、リダイレクトを確認します。
+
+```sh
+curl -i http://localhost:8080/1
+```
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/articles/sqlite
+```
+
+次に、1 つ目のターミナルで `Ctrl+C` を押してサーバを止めます。
+同じ SQLite ファイルを指定して、もう一度起動します。
+
+```sh
+STORAGE=sqlite SQLITE_PATH=/tmp/shortlink-day03.db go run ./cmd/server
+```
+
+再起動後に、同じ短縮コードへアクセスします。
+
+```sh
+curl -i http://localhost:8080/1
+```
+
+期待出力は、再起動前と同じ `302 Found` です。
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/articles/sqlite
+```
+
+メタ情報 API でも確認できます。
+
+```sh
+curl -i http://localhost:8080/api/links/1
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"code":"1","url":"https://example.com/articles/sqlite","short_url":"http://localhost:8080/1"}
+```
+
+これで、リンクの対応がプロセス内メモリではなく SQLite ファイルに残っていることを確認できました。
+同じ手順を `STORAGE=memory` で試すと、再起動後の `/1` は `404 Not Found` になります。
+この差が、永続化の効果です。
+
+存在しないコードも確認しておきます。
+
+```sh
+curl -i http://localhost:8080/missing
+```
+
+```http
+HTTP/1.1 404 Not Found
+Content-Type: application/json
+
+{"error":"link not found"}
+```
+
+保存先が SQLite でも、ハンドラから見るとエラーは `storage.ErrNotFound` です。
+そのため、メモリ保存と同じ JSON エラーを返せます。
+
+## クイズ
+
+<Quiz question="Go のインターフェース実装について正しい説明はどれですか？" choices={['型が必要なメソッドをすべて持っていれば、implements と書かなくてもそのインターフェースとして扱える', 'すべての型はファイル先頭で implements を宣言しなければならない', 'インターフェースは struct だけが実装でき、ポインタ型では使えない', 'インターフェースを使うとコンパイル時の型チェックがなくなる']} answer={0} explanation="Go のインターフェースは暗黙的実装です。Storage が求める Save、Load、Get を持つ MemoryStore と SQLiteStore は、明示的な implements 宣言なしで Storage として扱えます。" />
+
+<Quiz question="database/sql の *sql.DB として最も適切な説明はどれですか？" choices={['1 本の固定された接続そのもの', '接続の作成や再利用を管理するコネクションプール', 'SQL 文を文字列結合で作るためのヘルパー', 'SQLite 専用で Postgres には使えない型']} answer={1} explanation="*sql.DB は単一接続ではなく、必要に応じて接続を開き、再利用するためのプールです。HTTP サーバのように複数リクエストが来るプログラムではこの性質が重要です。" />
+
+<Quiz question="context.Context を引数に取る Go の慣習として正しいものはどれですか？" choices={['最後の引数に置く', '第一引数に置き、キャンセルやタイムアウトを下の層へ伝える', 'グローバル変数として保存する', 'JSON レスポンスに必ず埋め込む']} answer={1} explanation="Go では context.Context を第一引数に置くのが慣習です。ハンドラは r.Context() を storage 層へ渡し、キャンセルやタイムアウトを伝播できるようにしています。" />
+
+<Quiz question="ErrNotFound のようなセンチネルエラーを判定するとき、errors.Is を使う主な理由はどれですか？" choices={['エラーが fmt.Errorf(\"...: %w\", err) でラップされても種類を判定できるから', '文字列の大文字小文字を無視して比較できるから', 'HTTP ステータスコードを自動で設定できるから', 'nil エラーを必ず ErrNotFound に変換できるから']} answer={0} explanation="errors.Is は、ラップされたエラーの内側もたどって一致を確認できます。storage.ErrNotFound のようなセンチネルエラーを外側の層で判定するときに使います。" />
+
+## 今日のまとめ
+
+今日は、保存先を `Storage` インターフェースとして切り出し、メモリ保存と SQLite 保存を差し替えられる形にしました。
+ハンドラは `Save`、`Load`、`Get` という必要な操作だけを知り、具体的な保存方法は起動時に選びます。
+これにより、テストでは `MemoryStore`、ローカル永続化では `SQLiteStore` を使えます。
+
+Go のインターフェースは暗黙的実装です。
+`MemoryStore` と `SQLiteStore` は、`Storage` が求めるメソッドを持っているため、明示的な `implements` なしで同じ保存先として扱えます。
+この小さな抽象化が、Day 6 の Postgres、Day 8 の Redis、Day 11 以降の水平スケールへ進む土台になります。
+
+SQLite 実装では、`database/sql` の `*sql.DB` を使いました。
+`*sql.DB` は単一接続ではなくコネクションプールです。
+`modernc.org/sqlite` は cgo 不要で使えるため、これから Docker や Kubernetes へ進む教材の流れに合っています。
+
+また、`context.Context` を HTTP ハンドラから storage 層へ渡しました。
+キャンセルやタイムアウトを下へ伝えるためです。
+見つからないコードは `ErrNotFound` というセンチネルエラーに統一し、ハンドラでは `errors.Is` で判定しました。
+保存先の内部事情を外へ漏らさないことも、差し替えやすい設計の一部です。
+
+## 明日の予告
+
+Day 4 では、Go の並行処理をもう一段深く扱います。
+リダイレクトされた回数をクリック統計として記録し、goroutine、channel、select を使ってイベントを集計します。
+
+今日の保存先インターフェースは、明日の統計保存でも効いてきます。
+HTTP リクエストの流れを止めすぎず、裏側で安全に集計するにはどう設計するか。
+次は、URL 短縮サービスを題材に「並行処理とデータの整合性」を学びます。

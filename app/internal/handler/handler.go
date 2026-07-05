@@ -15,13 +15,13 @@ import (
 // Handler は URL 短縮 API の依存関係をまとめた型です。
 type Handler struct {
 	shortener *shortener.Shortener
-	store     *storage.MemoryStore
+	store     storage.Storage
 	baseURL   string
 }
 
 // New は Go 1.22 で追加された ServeMux の "METHOD /path" パターンを使って
 // ルーティングを登録します。
-func New(shortener *shortener.Shortener, store *storage.MemoryStore, baseURL string) http.Handler {
+func New(shortener *shortener.Shortener, store storage.Storage, baseURL string) http.Handler {
 	h := &Handler{
 		shortener: shortener,
 		store:     store,
@@ -72,7 +72,10 @@ func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := h.shortener.Next()
-	h.store.Save(code, req.URL)
+	if err := h.store.Save(r.Context(), code, req.URL); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal server error")
+		return
+	}
 	shortURL := h.shortURL(code)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -86,24 +89,24 @@ func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) getLink(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
-	originalURL, ok := h.store.Load(code)
-	if !ok {
-		writeJSONError(w, http.StatusNotFound, "link not found")
+	link, err := h.store.Get(r.Context(), code)
+	if err != nil {
+		writeStorageError(w, err)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, linkResponse{
-		Code:     code,
-		URL:      originalURL,
-		ShortURL: h.shortURL(code),
+		Code:     link.Code,
+		URL:      link.URL,
+		ShortURL: h.shortURL(link.Code),
 	})
 }
 
 func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
-	originalURL, ok := h.store.Load(code)
-	if !ok {
-		writeJSONError(w, http.StatusNotFound, "link not found")
+	originalURL, err := h.store.Load(r.Context(), code)
+	if err != nil {
+		writeStorageError(w, err)
 		return
 	}
 
@@ -134,6 +137,15 @@ func validateURL(raw string) error {
 
 func writeJSONError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorResponse{Error: message})
+}
+
+func writeStorageError(w http.ResponseWriter, err error) {
+	if errors.Is(err, storage.ErrNotFound) {
+		writeJSONError(w, http.StatusNotFound, "link not found")
+		return
+	}
+
+	writeJSONError(w, http.StatusInternalServerError, "internal server error")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

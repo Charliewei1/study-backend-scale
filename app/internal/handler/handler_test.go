@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -162,7 +163,9 @@ func TestGetLink(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h, store := newTestHandler()
-			store.Save(tt.seedCode, tt.seedURL)
+			if err := store.Save(context.Background(), tt.seedCode, tt.seedURL); err != nil {
+				t.Fatalf("Save returned error: %v", err)
+			}
 			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
 			rec := httptest.NewRecorder()
 
@@ -212,7 +215,9 @@ func TestRedirect(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h, store := newTestHandler()
-			store.Save(tt.seedCode, tt.seedURL)
+			if err := store.Save(context.Background(), tt.seedCode, tt.seedURL); err != nil {
+				t.Fatalf("Save returned error: %v", err)
+			}
 			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
 			rec := httptest.NewRecorder()
 

@@ -1,7 +1,9 @@
-// Package storage は短縮コードと元 URL の対応を保存します。
 package storage
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // MemoryStore はプロセス内メモリだけを使う保存先です。
 //
@@ -20,19 +22,40 @@ func NewMemoryStore() *MemoryStore {
 }
 
 // Save は code と url の対応を保存します。
-func (s *MemoryStore) Save(code, url string) {
+func (s *MemoryStore) Save(ctx context.Context, code, url string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.links[code] = url
+	return nil
 }
 
 // Load は code に対応する URL を返します。
-// 見つからない場合は ok=false になります。
-func (s *MemoryStore) Load(code string) (url string, ok bool) {
+// 見つからない場合は ErrNotFound を返します。
+func (s *MemoryStore) Load(ctx context.Context, code string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	url, ok = s.links[code]
-	return url, ok
+	url, ok := s.links[code]
+	if !ok {
+		return "", ErrNotFound
+	}
+	return url, nil
+}
+
+// Get は code に対応するリンクのメタ情報を返します。
+func (s *MemoryStore) Get(ctx context.Context, code string) (Link, error) {
+	url, err := s.Load(ctx, code)
+	if err != nil {
+		return Link{}, err
+	}
+	return Link{Code: code, URL: url}, nil
 }
