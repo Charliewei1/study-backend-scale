@@ -1,0 +1,401 @@
+---
+title: Day 6 - Docker Compose と Postgres 移行
+description: Docker Compose で Go アプリと Postgres を宣言的に起動し、SQLite からネットワーク越しに共有できるデータベースへ移行します。
+sidebar:
+  label: Day 6
+  order: 6
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+## 今日のゴール
+
+- なぜ SQLite から Postgres へ進むのかを、同時書き込み、ネットワーク越し共有、将来の複数レプリカと結びつけて説明できるようになる。
+- Docker Compose が、複数コンテナの環境を宣言的に表す道具だと理解する。
+- Compose のサービス名 DNS によるサービスディスカバリを説明できるようになる。
+- `depends_on` と `condition: service_healthy` によって、Postgres が Healthy になってからアプリを起動する設計を読めるようになる。
+- named volume によって、コンテナを再起動しても Postgres のデータが残る理由を説明できるようになる。
+- `pgxpool` が PostgreSQL 接続を使い回すコネクションプールだと理解する。
+- `STORAGE`、`DATABASE_URL`、`TEST_DATABASE_URL` のような環境変数ベース設定を、12-factor app の考え方と結びつけて読めるようになる。
+- `cd deploy && docker compose up -d --build` でアプリと Postgres を起動し、再起動後もデータが残ることを確認する。
+
+## 解説
+
+Day 5 では、Go 製 URL 短縮サービスを Docker イメージにしました。
+今日は、そのアプリコンテナと Postgres コンテナを Docker Compose で一緒に起動します。
+
+ここで大事なのは、単に「データベースを変える」ことではありません。
+保存先を SQLite から Postgres に変えることで、アプリを複数台に増やす準備を始めます。
+後日の Kubernetes やスケールアウトを理解するために、今日はアプリとデータベースを別プロセス、別コンテナ、ネットワーク越しの関係として扱います。
+
+### なぜ SQLite から Postgres へ進むのか
+
+Day 3 で使った SQLite は、とても良いデータベースです。
+1 つのファイルにデータを保存でき、セットアップも軽く、ローカル開発や小さなアプリには向いています。
+Go アプリから見ても、単体テストや手元の確認で扱いやすい保存先です。
+
+ただし、これから学ぶ「スケールするバックエンド」では、別の性質が必要になります。
+
+1 つ目は、同時書き込みです。
+URL 短縮サービスでは、複数のユーザーが同時に短縮 URL を作ったり、同時にリダイレクトしたりします。
+SQLite も並行処理に対応していますが、基本的には 1 ファイルを中心に扱うため、多数のプロセスや多数の書き込みが集まる構成では設計上の注意が増えます。
+
+2 つ目は、ネットワーク越しの共有です。
+アプリコンテナを 2 個、3 個と増やしたとき、それぞれが同じデータを読める必要があります。
+SQLite のファイルを各コンテナの中に持たせると、コンテナごとに別々のデータになります。
+共有ボリュームで 1 ファイルを共有する方法もありますが、複数アプリからの同時利用を本番構成の中心にするには向きません。
+
+Postgres は、最初からネットワーク越しに接続されるデータベースサーバです。
+複数のアプリプロセスが同じ Postgres に接続し、トランザクション、ロック、接続管理をデータベース側に任せられます。
+将来、アプリを複数レプリカに増やしても、共有すべき状態を Postgres に集められます。
+
+SQLite が悪いのではありません。
+1 プロセスで完結する小さなツール、ローカルアプリ、テスト、軽量なサービスでは強い選択肢です。
+一方、複数のアプリサーバがネットワーク越しに同じ状態を共有する構成では、Postgres のようなサーバ型データベースが自然です。
+
+### Docker Compose は宣言的な環境定義
+
+Day 5 では、アプリ単体を `docker run` で起動しました。
+しかし、アプリに Postgres が必要になると、毎回コマンドを長く書くのはつらくなります。
+
+そこで Docker Compose を使います。
+Compose では、どのサービスを起動するか、どのイメージを使うか、どの環境変数を渡すか、どのポートを公開するか、どのボリュームを使うかを YAML に書きます。
+
+今回の定義は `deploy/compose.yaml` です。
+
+```yaml title="deploy/compose.yaml"
+services:
+  app:
+    build:
+      context: ../app
+      dockerfile: ../deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      STORAGE: postgres
+      DATABASE_URL: postgres://shortlink:shortlink@postgres:5432/shortlink?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortlink -d shortlink"]
+
+volumes:
+  postgres-data:
+```
+
+Compose の良さは、実行環境がファイルとして読めることです。
+「アプリは Postgres を使う」
+「アプリは 8080 番を公開する」
+「Postgres のデータは named volume に置く」
+という構成が、コマンド履歴ではなくリポジトリ内の YAML に残ります。
+
+### サービス名 DNS によるディスカバリ
+
+`DATABASE_URL` をよく見ると、ホスト名が `postgres` になっています。
+
+```yaml title="deploy/compose.yaml"
+DATABASE_URL: postgres://shortlink:shortlink@postgres:5432/shortlink?sslmode=disable
+```
+
+この `postgres` は、インターネット上のドメイン名ではありません。
+Compose が作るネットワーク内で、サービス名を DNS 名として解決できるようにしてくれます。
+
+つまり、`app` コンテナから見ると、`postgres:5432` は Postgres コンテナを指します。
+コンテナの IP アドレスを直接書く必要はありません。
+コンテナは作り直されると IP が変わることがありますが、サービス名は構成の中で安定しています。
+
+これがサービスディスカバリの最初の形です。
+後日 Kubernetes に進むと、Service 名で Pod 群へ到達する考え方が出てきます。
+今日の `postgres` という名前解決は、その小さな予告です。
+
+### healthcheck と起動順序
+
+`app` サービスには、次の指定があります。
+
+```yaml title="deploy/compose.yaml"
+depends_on:
+  postgres:
+    condition: service_healthy
+```
+
+これは「`app` は `postgres` に依存する」という宣言です。
+さらに `condition: service_healthy` によって、Postgres の healthcheck が成功してから `app` を起動するようにしています。
+
+`pg_isready` は、Postgres が接続を受け付けられる状態か確認するコマンドです。
+コンテナが起動しただけでは、データベースがすぐ使えるとは限りません。
+初期化中かもしれませんし、まだポートを受け付けていないかもしれません。
+
+アプリが先に起動してすぐ接続し、Postgres がまだ準備中なら、起動時に失敗する可能性があります。
+そこで、Postgres が Healthy になってからアプリを Started にする構成にしています。
+
+今回の実行では、Compose の出力でも `postgres` が Healthy になってから `app` が Started になることを確認できます。
+この順序は、手順のところで実際に見ます。
+
+### named volume でデータを残す
+
+Postgres のデータは、コンテナ内の `/var/lib/postgresql/data` に保存されます。
+ただし、コンテナの中だけにデータを置くと、コンテナを削除したときにデータも消えます。
+
+そこで、named volume を使います。
+
+```yaml title="deploy/compose.yaml"
+volumes:
+  - postgres-data:/var/lib/postgresql/data
+```
+
+`postgres-data` は Docker が管理する named volume です。
+コンテナそのものを再起動しても、同じ volume を再利用すればデータは残ります。
+今日の手順では、短縮 URL を作ったあとに `docker compose restart app` でアプリだけを再起動し、保存済みのコードがまだリダイレクトできることを確認します。
+
+一方で、`docker compose down -v` を実行すると、この named volume も削除されます。
+`-v` は「Compose が管理する volume も消す」という強い指定です。
+手元の演習環境をきれいに片付けたいときに使いますが、本番データが入った volume に対して軽く使うものではありません。
+
+### pgxpool で Postgres に接続する
+
+アプリ側の Postgres 実装は `app/internal/storage/postgres.go` にあります。
+ここでは `github.com/jackc/pgx/v5/pgxpool` を使っています。
+
+```go title="app/internal/storage/postgres.go"
+type PostgresStore struct {
+	pool *pgxpool.Pool
+}
+
+func NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, error) {
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("open postgres pool: %w", err)
+	}
+	// init(ctx) で CREATE TABLE IF NOT EXISTS を実行する
+}
+```
+
+`pgxpool.Pool` は PostgreSQL 接続のプールです。
+HTTP リクエストのたびに TCP 接続を作り直すと遅くなり、接続数も増えすぎます。
+コネクションプールは接続を再利用し、同時アクセス時の DB 接続を管理しやすくします。
+
+起動時には、必要なテーブルを作ります。
+
+```go title="app/internal/storage/postgres.go"
+CREATE TABLE IF NOT EXISTS links (
+	code TEXT PRIMARY KEY,
+	url TEXT NOT NULL,
+	clicks BIGINT NOT NULL DEFAULT 0,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+`CREATE TABLE IF NOT EXISTS` なので、初回起動ではテーブルを作り、2 回目以降は既存テーブルをそのまま使います。
+本格的なサービスではマイグレーションツールを使うことが多いですが、教材のこの段階では起動時に最低限のスキーマを用意します。
+
+保存やクリック数の更新も、Postgres への SQL として実行します。
+
+```go title="app/internal/storage/postgres.go"
+INSERT INTO links (code, url)
+VALUES ($1, $2)
+ON CONFLICT (code) DO UPDATE SET url = excluded.url;
+
+UPDATE links SET clicks = clicks + 1 WHERE code = $1;
+```
+
+`$1` や `$2` はプレースホルダです。
+文字列を SQL に直接連結しないことで、SQL インジェクションを避けやすくなります。
+クリック数はアプリのメモリで読んで足すのではなく、DB 側で `clicks = clicks + 1` と更新します。
+
+### STORAGE と DATABASE_URL で切り替える
+
+`cmd/server/main.go` では、環境変数 `STORAGE` によって保存先を切り替えています。
+
+```go title="app/cmd/server/main.go"
+switch os.Getenv("STORAGE") {
+case "", "memory":
+	return storage.NewMemoryStore(), func() {}
+case "sqlite":
+	// SQLITE_PATH がなければ data.db
+case "postgres":
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL is required when STORAGE=postgres")
+	}
+	store, err := storage.NewPostgresStore(context.Background(), databaseURL)
+}
+```
+
+アプリのコードには、Compose 専用の分岐はありません。
+`STORAGE=postgres` と `DATABASE_URL=...` を渡せば Postgres を使い、何も指定しなければメモリ保存になります。
+設定を環境変数から受け取る設計は、12-factor app の考え方にも合っています。
+
+12-factor app では、接続先、ポート番号、認証情報のように環境ごとに変わるものを、ソースコードに埋め込まないようにします。
+同じアプリイメージを使い、環境変数で開発、CI、本番の振る舞いを変えるためです。
+
+### skip 可能な Postgres 統合テスト
+
+Postgres 実装にはテストもあります。
+ただし、Postgres は外部プロセスです。
+`go test ./...` を実行するたびに、必ずローカルに Postgres が起動しているとは限りません。
+
+```go title="app/internal/storage/postgres_test.go"
+databaseURL := os.Getenv("TEST_DATABASE_URL")
+if databaseURL == "" {
+	t.Skip("TEST_DATABASE_URL is not set")
+}
+```
+
+`TEST_DATABASE_URL` が未設定なら `t.Skip` します。
+これは「テストしなくてよい」ではなく、「外部 DB が必要な統合テストは、準備された環境でだけ実行する」という判断です。
+普段の単体テストを軽く保ちながら、必要な環境では Postgres との接続、SQL、実スキーマを確認できます。
+
+テストごとに一意な `prefix` を付け、最後に `DELETE FROM links WHERE code LIKE $1` で掃除する点も重要です。
+共有 DB を使う統合テストでは、データの衝突と片付けを意識します。
+
+## 手を動かす
+
+ここでは、Compose で Postgres とアプリを起動します。
+Day 5 と違い、リポジトリルートではなく `deploy/` に移動してから実行します。
+
+まず、アプリと Postgres をビルドして起動します。
+
+```sh
+cd deploy
+docker compose up -d --build
+```
+
+期待出力は、Postgres が Healthy になってから app が Started になる形です。
+Docker Compose のバージョンにより細部は変わりますが、検証済みの実挙動では次の順序が見えます。
+
+```txt
+[+] Running 4/4
+ ✔ Network deploy_default          Created
+ ✔ Volume "deploy_postgres-data"   Created
+ ✔ Container deploy-postgres-1     Healthy
+ ✔ Container deploy-app-1          Started
+```
+
+ヘルスチェックします。
+
+```sh
+curl http://localhost:8080/healthz
+```
+
+期待出力です。
+
+```txt
+ok
+```
+
+短縮 URL を 1 つ作ります。
+
+```sh
+curl -s -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/day6"}'
+```
+
+期待出力は次のような JSON です。
+最初の作成なら `code` は `0` になります。
+
+```json
+{"code":"0","short_url":"http://localhost:8080/0"}
+```
+
+リダイレクトを確認します。
+
+```sh
+curl -i http://localhost:8080/0
+```
+
+期待出力では、`302 Found` と `Location` ヘッダーが見えます。
+
+```txt
+HTTP/1.1 302 Found
+Location: https://example.com/day6
+```
+
+ここで、アプリコンテナだけを再起動します。
+Postgres コンテナと named volume は残したままです。
+
+```sh
+docker compose restart app
+```
+
+期待出力です。
+
+```txt
+[+] Restarting 1/1
+ ✔ Container deploy-app-1  Started
+```
+
+再起動後、同じコードをもう一度確認します。
+
+```sh
+curl -i http://localhost:8080/0
+```
+
+期待出力は、再起動前と同じく `302 Found` です。
+これは、データがアプリコンテナのメモリではなく Postgres に保存され、Postgres のデータが named volume に残っているためです。
+
+```txt
+HTTP/1.1 302 Found
+Location: https://example.com/day6
+```
+
+最後に片付けます。
+演習データを残さないため、ここでは `-v` を付けて named volume も削除します。
+
+```sh
+docker compose down -v
+```
+
+期待出力です。
+
+```txt
+[+] Running 4/4
+ ✔ Container deploy-app-1          Removed
+ ✔ Container deploy-postgres-1     Removed
+ ✔ Network deploy_default          Removed
+ ✔ Volume deploy_postgres-data     Removed
+```
+
+`down -v` のあとにもう一度起動すると、Postgres は空の状態から始まります。
+今日の確認で使った `code=0` は消えています。
+再起動では残り、volume 削除では消える。
+この違いを体で覚えておきましょう。
+
+## クイズ
+
+<Quiz question="depends_on と condition: service_healthy の説明として正しいものはどれですか？" choices={['依存先コンテナの healthcheck が成功してから、依存するサービスを起動するための指定', '依存先コンテナを毎秒再起動するための指定', 'アプリの HTTP レスポンスを自動でキャッシュする指定', 'Postgres のデータを自動で暗号化する指定']} answer={0} explanation="今回の compose.yaml では、postgres の pg_isready が成功し Healthy になってから app が Started になります。コンテナ起動だけでなく、利用可能な状態を待つ点が重要です。" />
+
+<Quiz question="named volume の寿命について正しいものはどれですか？" choices={['通常のコンテナ再起動では残るが、docker compose down -v では削除される', 'docker compose restart app のたびに必ず削除される', 'アプリの HTTP リクエストごとに作り直される', 'Dockerfile を変更すると必ず削除される']} answer={0} explanation="postgres-data は Docker が管理する named volume です。コンテナの再起動や作り直しでは再利用できますが、down -v を指定すると削除対象になります。" />
+
+<Quiz question="Compose の DATABASE_URL で host に postgres と書ける理由はどれですか？" choices={['Compose のネットワーク内ではサービス名が DNS 名として解決されるため', 'Postgres は必ず localhost という別名を持つため', 'Dockerfile の EXPOSE が DNS レコードを作るため', 'Go の pgxpool が任意の文字列を自動で localhost に変換するため']} answer={0} explanation="Compose は同じプロジェクトのサービスを同一ネットワークに接続し、サービス名で名前解決できるようにします。app から postgres:5432 へ接続できるのはこのためです。" />
+
+<Quiz question="SQLite と Postgres の使い分けとして、この教材の文脈で最も適切なものはどれですか？" choices={['SQLite は軽量なローカル保存に向き、複数アプリからネットワーク越しに共有する本番構成では Postgres が向きやすい', 'SQLite はネットワーク越し共有専用で、Postgres は 1 ファイル保存専用である', 'Postgres は同時書き込みを扱えないため、スケールするサービスでは使わない', 'SQLite を使うと Docker Compose が使えなくなる']} answer={0} explanation="SQLite は手軽で強力ですが、複数レプリカのアプリが同じ状態を共有する構成では、サーバ型 DB の Postgres が自然です。用途に応じて選ぶことが大切です。" />
+
+## 今日のまとめ
+
+今日は、Docker Compose で `app` と `postgres` を一緒に起動しました。
+Compose は、複数コンテナの構成を YAML に宣言できる道具です。
+ビルド方法、公開ポート、環境変数、依存関係、healthcheck、volume がファイルとして残るため、手順が再現しやすくなります。
+
+SQLite から Postgres へ進む理由も確認しました。
+SQLite は軽くて扱いやすい保存先です。
+一方、複数のアプリプロセスがネットワーク越しに同じ状態を共有し、同時書き込みを扱い、将来アプリを複数レプリカにする構成では、Postgres のようなサーバ型データベースが向いています。
+
+`DATABASE_URL` のホスト名 `postgres` は、Compose のサービス名 DNS によって解決されます。
+`depends_on` と `condition: service_healthy` により、Postgres が接続可能になってからアプリを起動できます。
+`postgres-data` named volume によって、アプリを再起動してもデータは残り、`docker compose down -v` で明示的に消せます。
+
+アプリ側では `pgxpool` を使って Postgres 接続をプールしました。
+`STORAGE` と `DATABASE_URL` で保存先を切り替える設計は、設定をコードから分離する 12-factor app の考え方につながります。
+Postgres 統合テストは `TEST_DATABASE_URL` があるときだけ実行し、普段のテストを壊さず、必要な環境では実 DB との接続を確認できるようにしました。
+
+## 明日の予告
+Day 7 では、k6 で負荷をかけて計測します。
+今日 Postgres に移行したことで、アプリの保存先はより本番構成に近づきました。
+次は「速そう」「遅そう」と想像するのではなく、リクエスト数、レイテンシ、p95 などの数値で状態を見ます。

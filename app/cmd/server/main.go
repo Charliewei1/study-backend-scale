@@ -87,8 +87,21 @@ func newStore() (storage.Storage, func()) {
 				log.Printf("close sqlite storage: %v", err)
 			}
 		}
+	case "postgres":
+		databaseURL := os.Getenv("DATABASE_URL")
+		if databaseURL == "" {
+			log.Fatal("DATABASE_URL is required when STORAGE=postgres")
+		}
+
+		store, err := storage.NewPostgresStore(context.Background(), databaseURL)
+		if err != nil {
+			log.Fatalf("initialize postgres storage: %v", err)
+		}
+		return store, func() {
+			store.Close()
+		}
 	default:
-		log.Fatalf("unsupported STORAGE %q; want memory or sqlite", os.Getenv("STORAGE"))
+		log.Fatalf("unsupported STORAGE %q; want memory, sqlite, or postgres", os.Getenv("STORAGE"))
 		return nil, func() {}
 	}
 }
