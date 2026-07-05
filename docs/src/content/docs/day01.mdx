@@ -1,0 +1,398 @@
+---
+title: Day 1 - Go 入門と最小の URL 短縮サーバ
+description: Go の標準ライブラリだけで動く最小の URL 短縮サーバを読み、net/http、パッケージ構成、base62、メモリ保存の基本を学びます。
+sidebar:
+  label: Day 1
+  order: 1
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+## 今日のゴール
+
+- Go で Web サーバを作るときの基本形を説明できるようになる。
+- `cmd/server/main.go` と `internal/` 配下の役割分担を読めるようになる。
+- `net/http` がリクエストを受け、ハンドラへ処理を渡す流れを理解する。
+- goroutine と共有データの関係を知り、mutex が必要な理由を説明できるようになる。
+- base62 の考え方と、6 文字で `62^6` 通りを表せる理由を計算できるようになる。
+- `go run` と `curl` で、作成、リダイレクト、ヘルスチェックを確認する。
+
+## 解説
+
+今日は、URL 短縮サービス `shortlink` の最初の姿を読みます。
+URL 短縮サービスは、長い URL に短いコードを対応づけるサービスです。
+たとえば `https://example.com/articles/go` に対して `1` のようなコードを発行し、`http://localhost:8080/1` へアクセスされたら元の URL へリダイレクトします。
+
+Day 1 の実装は、あえて小さく作っています。
+データベースも、Web フレームワークも、外部ライブラリも使いません。
+Go の標準ライブラリだけで、HTTP、JSON、リダイレクト、排他制御、短縮コード生成を体験します。
+
+### Go の思想: シンプルさと明示性
+
+Go は「読んだときに何が起きるか追いやすいこと」を大事にします。
+このアプリの起動処理も、環境変数を読み、部品を作り、HTTP サーバを起動するだけです。
+まず `main` 関数を見てみましょう。
+
+```go title="app/cmd/server/main.go"
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	baseURL := fmt.Sprintf("http://localhost:%s", port)
+	h := handler.New(shortener.New(), storage.NewMemoryStore(), baseURL)
+
+	addr := ":" + port
+	log.Printf("shortlink server listening on %s", addr)
+	if err := http.ListenAndServe(addr, h); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+`PORT` が未指定なら `8080` を使います。
+`baseURL` は、レスポンスの `short_url` に入れる URL の土台です。
+`handler.New(...)` には、短縮コードを作る `shortener` と、コードを保存する `storage` を渡しています。
+
+Go では、アプリの入口は `main` パッケージの `main` 関数です。
+失敗する可能性がある処理はエラーを返し、ここでも `http.ListenAndServe` のエラーを明示的に確認しています。
+
+### パッケージ構成: 責務ごとに分ける
+
+Day 1 の `app/` は、次の 4 つが中心です。
+
+```txt title="app/ の主な構成"
+app/
+  cmd/server/main.go
+  internal/handler/handler.go
+  internal/shortener/shortener.go
+  internal/storage/memory.go
+```
+
+`cmd/server/main.go` は起動係、`internal/handler/handler.go` は HTTP の入口、`internal/shortener/shortener.go` は短縮コード生成、`internal/storage/memory.go` はコードと URL の保存を担当します。
+Go の `internal` 配下のパッケージは、その親ディレクトリの外から直接 import できません。
+このアプリ内部で使う実装だと示せます。
+
+責務を分ける理由は、あとで変えやすくするためです。
+今日はメモリ保存ですが、Day 3 では SQLite、Day 6 では Postgres へ進みます。
+保存の処理が `storage` にまとまっていると、HTTP ハンドラ全体を書き直さずに保存先を育てられます。
+
+### HTTP の入口: ServeMux とハンドラ
+
+Go の標準ライブラリには `net/http` があります。
+このアプリは外部ルーターではなく、標準の `http.ServeMux` を使っています。
+`ServeMux` は、HTTP メソッドとパスを見て、どの関数へ処理を渡すか決める部品です。
+
+```go title="app/internal/handler/handler.go"
+func New(shortener *shortener.Shortener, store *storage.MemoryStore, baseURL string) http.Handler {
+	h := &Handler{
+		shortener: shortener,
+		store:     store,
+		baseURL:   strings.TrimRight(baseURL, "/"),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", h.healthz)
+	mux.HandleFunc("POST /api/links", h.createLink)
+	mux.HandleFunc("GET /{code}", h.redirect)
+	return mux
+}
+```
+
+`GET /healthz` はヘルスチェックです。
+`POST /api/links` は短縮 URL を作ります。
+`GET /{code}` は、`/1` のようなパスから `code` を取り出してリダイレクトします。
+
+`"METHOD /path"` という書き方は Go 1.22 以降の `ServeMux` のパターンです。
+`GET /{code}` の `{code}` は、あとで `r.PathValue("code")` で取り出せます。
+このため Day 1 では、ルーティング用のフレームワークを入れなくても十分です。
+
+短縮 URL を作る処理は `createLink` です。
+
+```go title="app/internal/handler/handler.go"
+func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
+	var req createLinkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if req.URL == "" {
+		http.Error(w, "url is required", http.StatusBadRequest)
+		return
+	}
+
+	code := h.shortener.Next()
+	h.store.Save(code, req.URL)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(createLinkResponse{
+		Code:     code,
+		ShortURL: h.baseURL + "/" + code,
+	})
+}
+```
+
+HTTP ハンドラは `http.ResponseWriter` と `*http.Request` を受け取ります。
+`r.Body` から `{"url":"https://..."}` を読み、壊れた JSON や空の URL なら `400 Bad Request` を返します。
+問題なければ `h.shortener.Next()` でコードを作り、`h.store.Save(code, req.URL)` で保存し、`201 Created` と JSON を返します。
+
+リダイレクトは `redirect` です。
+
+```go title="app/internal/handler/handler.go"
+func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	url, ok := h.store.Load(code)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	http.Redirect(w, r, url, http.StatusFound)
+}
+```
+
+`r.PathValue("code")` で `/1` の `1` を取り出します。
+保存先にあれば `http.Redirect` で元 URL へ `302 Found` を返します。
+なければ `404 Not Found` です。
+
+ヘルスチェックは、今は単に `ok` を返します。
+Day 10 で Kubernetes の liveness/readiness を扱うとき、この考え方が戻ってきます。
+
+### net/http と goroutine
+
+Go の `net/http` サーバは、接続やリクエストの処理に goroutine を使います。
+goroutine は Go の軽量な並行処理の単位で、Go ランタイムが多数の goroutine を少数の OS スレッド上で動かします。
+
+つまり、複数のリクエストが同時に来る可能性があります。
+そのとき共有データをそのまま触ると、同じ ID を発行したり、`map` の同時読み書きで壊れたりします。
+Day 1 のコードは、採番器とメモリ保存先を mutex で守っています。
+
+採番器は、次に使う ID を `nextID` に持ちます。
+
+```go title="app/internal/shortener/shortener.go"
+type Shortener struct {
+	mu     sync.Mutex
+	nextID uint64
+}
+```
+
+`Next()` は `nextID` を読み、1 増やし、base62 に変換します。
+`Lock()` から `Unlock()` までの間は同時に 1 つの goroutine だけが入れるため、ID の重複を防げます。
+
+```go title="app/internal/shortener/shortener.go"
+func (s *Shortener) Next() string {
+	s.mu.Lock()
+	id := s.nextID
+	s.nextID++
+	s.mu.Unlock()
+
+	return Encode(id)
+}
+```
+
+メモリ保存先は `map[string]string` を使います。
+キーが短縮コード、値が元 URL です。
+
+```go title="app/internal/storage/memory.go"
+type MemoryStore struct {
+	mu    sync.RWMutex
+	links map[string]string
+}
+```
+
+Go の `map` は、そのままでは同時読み書きに安全ではありません。
+そこで `sync.RWMutex` を使います。
+書き込みの `Save` では `Lock()`、読み取りの `Load` では `RLock()` です。
+
+```go title="app/internal/storage/memory.go"
+func (s *MemoryStore) Save(code, url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.links[code] = url
+}
+```
+
+```go title="app/internal/storage/memory.go"
+func (s *MemoryStore) Load(code string) (url string, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	url, ok = s.links[code]
+	return url, ok
+}
+```
+
+`RWMutex` は読み取り同士を複数同時に通せます。
+URL 短縮サービスは「作成」より「リダイレクト」のほうが多くなりやすいので、この性質は題材に合っています。
+ただし、これはプロセス内メモリです。
+サーバを止めるとデータは消え、複数台に増やすとそれぞれのプロセスが別々の `map` を持ちます。
+
+### base62 の理屈
+
+URL 短縮では、短くて URL に入れやすいコードが必要です。
+この実装は、内部の連番 ID を base62 文字列へ変換します。
+
+```go title="app/internal/shortener/shortener.go"
+const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+```
+
+数字 10 種類、小文字 26 種類、大文字 26 種類なので、合計 `62` 種類です。
+6 文字なら `62^6` 通りです。
+
+```txt
+62^1 = 62
+62^2 = 3,844
+62^3 = 238,328
+62^4 = 14,776,336
+62^5 = 916,132,832
+62^6 = 56,800,235,584
+```
+
+6 文字で約 568 億通りを表せます。
+数字だけの 6 桁は 100 万通りなので、同じ長さでもかなり差があります。
+
+変換処理は、10 進数を文字列にする考え方と同じです。
+数値を 62 で割り、余りを 1 桁として取り出します。
+余りは下の桁から出るので、最後に反転します。
+
+```go title="app/internal/shortener/shortener.go"
+func Encode(id uint64) string {
+	if id == 0 {
+		return string(alphabet[0])
+	}
+
+	var reversed []byte
+	base := uint64(len(alphabet))
+	for id > 0 {
+		remainder := id % base
+		reversed = append(reversed, alphabet[remainder])
+		id = id / base
+	}
+
+	// 余りは下の桁から出てくるため、最後に反転して人が読む順番に戻します。
+	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
+		reversed[i], reversed[j] = reversed[j], reversed[i]
+	}
+
+	return string(reversed)
+}
+```
+
+たとえば ID `62` は、余りが `0`、次に `1` になります。
+取り出した順は下の桁からなので、反転して `"10"` です。
+この `alphabet` では ID `1` は `"1"`、ID `10` は `"a"`、ID `35` は `"z"`、ID `36` は `"A"` になります。
+
+Day 1 の `Shortener` は `nextID: 1` から始めるので、最初に作られるコードは `"1"` です。
+
+## 手を動かす
+
+ターミナルを 2 つ使います。
+1 つ目でサーバを起動し、2 つ目で `curl` を実行します。
+
+```sh
+cd app
+go run ./cmd/server
+```
+
+期待するログは次の形です。
+日付や時刻が前に付くことがあります。
+
+```txt
+shortlink server listening on :8080
+```
+
+別のターミナルで、まずヘルスチェックを確認します。
+
+```sh
+curl -i http://localhost:8080/healthz
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+
+ok
+```
+
+次に、短縮 URL を作ります。
+
+```sh
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/articles/go"}'
+```
+
+サーバ起動後の最初の作成なら、期待出力は次の形です。
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"code":"1","short_url":"http://localhost:8080/1"}
+```
+
+もう一度同じ `POST` を実行すると、次は `"2"` が返ります。
+サーバを止めて再起動するとメモリは消えるので、また `"1"` から始まります。
+
+作った短縮 URL にアクセスします。
+
+```sh
+curl -i http://localhost:8080/1
+```
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/articles/go
+```
+
+`Location` ヘッダに元 URL が入っていれば成功です。
+実際に移動先まで追いかける場合は、`curl -L http://localhost:8080/1` とします。
+
+存在しないコードも確認しましょう。
+
+```sh
+curl -i http://localhost:8080/not-found
+```
+
+```http
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=utf-8
+
+404 page not found
+```
+
+ここまでで、`POST /api/links`、`GET /{code}`、`GET /healthz` の API 契約を確認できました。
+
+## クイズ
+
+<Quiz question="Go の net/http サーバが複数リクエストを並行処理できる主な理由はどれですか？" choices={['すべてのリクエストを 1 つのグローバル変数に保存するから', 'リクエスト処理に goroutine が使われ、軽量な並行処理ができるから', 'HTTP は必ず 1 秒に 1 件だけ届く仕様だから', 'JSON デコードが自動的にロックを取るから']} answer={1} explanation="net/http は接続やリクエストの処理に goroutine を使います。そのため複数のリクエストを並行に扱えますが、共有データには mutex などの保護が必要です。" />
+
+<Quiz question="base62 の 6 文字で表せる組み合わせ数として最も近いものはどれですか？" choices={['62 * 6 = 372 通り', '10^6 = 100 万通り', '62^6 = 約 568 億通り', '2^62 = 約 461 京通り']} answer={2} explanation="base62 は 1 桁ごとに 62 種類を選べます。6 文字なら 62 を 6 回掛けるので 62^6 = 56,800,235,584、約 568 億通りです。" />
+
+<Quiz question="Day 1 の ServeMux 登録で、POST /api/links を処理する関数はどれですか？" choices={['h.healthz', 'h.createLink', 'h.redirect', 'h.store.Load']} answer={1} explanation="handler.New では POST /api/links を h.createLink に登録しています。短縮 URL の作成は createLink が担当します。" />
+
+<Quiz question="MemoryStore が sync.RWMutex を使っている理由として正しいものはどれですか？" choices={['map の同時読み書きを安全にし、読み取りは複数同時に通せるようにするため', 'JSON のキー順を固定するため', 'HTTP ステータスコードを自動で 201 にするため', 'サーバ再起動後もデータを永続化するため']} answer={0} explanation="Go の map は同時読み書きに安全ではありません。RWMutex を使うと書き込みは排他しつつ、読み取り同士は複数同時に進められます。ただしメモリ保存なので永続化はされません。" />
+
+## 今日のまとめ
+
+今日は、Go の標準ライブラリだけで動く最小の URL 短縮サーバを読みました。
+`cmd/server/main.go` は起動処理、`internal/handler` は HTTP の入口、`internal/shortener` は短縮コード生成、`internal/storage` はコードと URL の保存を担当します。
+
+`net/http` はリクエストを goroutine で並行処理できます。
+そのため、共有される `nextID` や `map` は mutex で守る必要があります。
+`Shortener` は `sync.Mutex`、`MemoryStore` は読み取りに強い `sync.RWMutex` を使っています。
+
+base62 は 62 種類の文字で数値を表す方法です。
+6 文字で `62^6 = 56,800,235,584` 通り、つまり約 568 億通りを表せます。
+短い URL に多くのコードを詰め込めるので、URL 短縮サービスと相性が良い考え方です。
+
+## 明日の予告
+
+Day 2 では、API 設計とテスト文化に進みます。
+今日の実装では、エラーは `http.Error` のテキストレスポンスです。
+明日は JSON エラーレスポンスへ揃え、URL バリデーションを追加し、`httptest` でハンドラを自動テストします。
+
+「手で curl して動いた」から一歩進んで、「コードとして期待動作を残す」段階へ入ります。

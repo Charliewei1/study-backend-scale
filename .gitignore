@@ -1,0 +1,19 @@
+# Node / Astro
+node_modules/
+docs/dist/
+docs/.astro/
+
+# Go
+app/bin/
+*.test
+*.out
+
+# Local data
+*.db
+*.sqlite
+tmp/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,162 @@
+---
+interface Props {
+  question: string;
+  choices: string[];
+  answer: number;
+  explanation: string;
+}
+
+const { question, choices, answer, explanation } = Astro.props;
+const quizId = `quiz-${Math.random().toString(36).slice(2)}`;
+
+if (!Number.isInteger(answer) || answer < 0 || answer >= choices.length) {
+  throw new Error(`Quiz answer must be a 0-indexed choice number. Received: ${answer}`);
+}
+---
+
+<section class="quiz" data-quiz data-answer={answer} aria-labelledby={quizId}>
+  <p id={quizId} class="quiz__question">{question}</p>
+  <div class="quiz__choices" role="list">
+    {
+      choices.map((choice, index) => (
+        <button class="quiz__choice" type="button" data-choice={index} aria-pressed="false">
+          <span class="quiz__choice-marker">{String.fromCharCode(65 + index)}</span>
+          <span>{choice}</span>
+        </button>
+      ))
+    }
+  </div>
+  <p class="quiz__result" data-result aria-live="polite"></p>
+  <p class="quiz__explanation" data-explanation hidden>{explanation}</p>
+</section>
+
+<script>
+  const initializeQuiz = (root: Element) => {
+    if (!(root instanceof HTMLElement) || root.dataset.initialized === 'true') return;
+
+    root.dataset.initialized = 'true';
+    const answer = Number(root.dataset.answer);
+    const choices = Array.from(root.querySelectorAll<HTMLButtonElement>('[data-choice]'));
+    const result = root.querySelector<HTMLElement>('[data-result]');
+    const explanation = root.querySelector<HTMLElement>('[data-explanation]');
+
+    choices.forEach((button) => {
+      button.addEventListener('click', () => {
+        const selected = Number(button.dataset.choice);
+        const isCorrect = selected === answer;
+
+        choices.forEach((choice) => {
+          const choiceIndex = Number(choice.dataset.choice);
+          choice.setAttribute('aria-pressed', String(choiceIndex === selected));
+          choice.dataset.state = choiceIndex === answer ? 'correct' : choiceIndex === selected ? 'incorrect' : 'neutral';
+        });
+
+        if (result) {
+          result.textContent = isCorrect ? '正解です。' : '不正解です。正解の選択肢を確認しましょう。';
+          result.dataset.state = isCorrect ? 'correct' : 'incorrect';
+        }
+
+        if (explanation) {
+          explanation.hidden = false;
+        }
+      });
+    });
+  };
+
+  document.querySelectorAll('[data-quiz]').forEach(initializeQuiz);
+</script>
+
+<style>
+  .quiz {
+    margin: 1.5rem 0;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5, #cbd5e1);
+    border-radius: 0.5rem;
+    background: var(--sl-color-bg, #fff);
+    color: var(--sl-color-text, #111827);
+  }
+
+  .quiz__question {
+    margin: 0 0 0.875rem;
+    font-weight: 700;
+    line-height: 1.6;
+  }
+
+  .quiz__choices {
+    display: grid;
+    gap: 0.625rem;
+  }
+
+  .quiz__choice {
+    display: grid;
+    grid-template-columns: 2rem minmax(0, 1fr);
+    align-items: start;
+    gap: 0.75rem;
+    width: 100%;
+    padding: 0.75rem;
+    border: 1px solid var(--sl-color-gray-5, #cbd5e1);
+    border-radius: 0.375rem;
+    background: var(--sl-color-bg-nav, var(--sl-color-bg, #fff));
+    color: inherit;
+    font: inherit;
+    line-height: 1.5;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .quiz__choice:hover,
+  .quiz__choice:focus-visible {
+    border-color: var(--sl-color-accent, #2563eb);
+    outline: none;
+    box-shadow: 0 0 0 3px var(--sl-color-accent-low, rgba(37, 99, 235, 0.18));
+  }
+
+  .quiz__choice-marker {
+    display: inline-grid;
+    place-items: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 999px;
+    background: var(--sl-color-gray-6, #e2e8f0);
+    color: var(--sl-color-gray-1, #0f172a);
+    font-weight: 700;
+  }
+
+  .quiz__choice[data-state='correct'] {
+    border-color: var(--sl-color-green, #15803d);
+    background: var(--sl-color-green-low, #dcfce7);
+    color: var(--sl-color-green-high, #14532d);
+  }
+
+  .quiz__choice[data-state='incorrect'] {
+    border-color: var(--sl-color-red, #b91c1c);
+    background: var(--sl-color-red-low, #fee2e2);
+    color: var(--sl-color-red-high, #7f1d1d);
+  }
+
+  .quiz__choice[data-state='neutral'] {
+    opacity: 0.74;
+  }
+
+  .quiz__result {
+    margin: 0.875rem 0 0;
+    font-weight: 700;
+  }
+
+  .quiz__result[data-state='correct'] {
+    color: var(--sl-color-green-high, #166534);
+  }
+
+  .quiz__result[data-state='incorrect'] {
+    color: var(--sl-color-red-high, #991b1b);
+  }
+
+  .quiz__explanation {
+    margin: 0.5rem 0 0;
+    padding: 0.75rem;
+    border-left: 4px solid var(--sl-color-accent, #2563eb);
+    background: var(--sl-color-accent-low, #dbeafe);
+    color: var(--sl-color-text, #111827);
+    line-height: 1.7;
+  }
+</style>
