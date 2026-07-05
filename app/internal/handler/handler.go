@@ -17,20 +17,27 @@ type Handler struct {
 	shortener *shortener.Shortener
 	store     storage.Storage
 	baseURL   string
+	clicks    clickRecorder
+}
+
+type clickRecorder interface {
+	Record(code string) bool
 }
 
 // New は Go 1.22 で追加された ServeMux の "METHOD /path" パターンを使って
 // ルーティングを登録します。
-func New(shortener *shortener.Shortener, store storage.Storage, baseURL string) http.Handler {
+func New(shortener *shortener.Shortener, store storage.Storage, baseURL string, clicks clickRecorder) http.Handler {
 	h := &Handler{
 		shortener: shortener,
 		store:     store,
 		baseURL:   strings.TrimRight(baseURL, "/"),
+		clicks:    clicks,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("POST /api/links", h.createLink)
+	mux.HandleFunc("GET /api/links/{code}/stats", h.getLinkStats)
 	mux.HandleFunc("GET /api/links/{code}", h.getLink)
 	mux.HandleFunc("GET /{code}", h.redirect)
 	return mux
@@ -49,6 +56,12 @@ type linkResponse struct {
 	Code     string `json:"code"`
 	URL      string `json:"url"`
 	ShortURL string `json:"short_url"`
+}
+
+type linkStatsResponse struct {
+	Code   string `json:"code"`
+	URL    string `json:"url"`
+	Clicks int64  `json:"clicks"`
 }
 
 type errorResponse struct {
@@ -102,12 +115,31 @@ func (h *Handler) getLink(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) getLinkStats(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	link, err := h.store.Get(r.Context(), code)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, linkStatsResponse{
+		Code:   link.Code,
+		URL:    link.URL,
+		Clicks: link.Clicks,
+	})
+}
+
 func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
 	originalURL, err := h.store.Load(r.Context(), code)
 	if err != nil {
 		writeStorageError(w, err)
 		return
+	}
+
+	if h.clicks != nil {
+		h.clicks.Record(code)
 	}
 
 	http.Redirect(w, r, originalURL, http.StatusFound)

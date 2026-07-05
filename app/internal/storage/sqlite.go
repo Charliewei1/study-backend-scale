@@ -34,11 +34,45 @@ func (s *SQLiteStore) init(ctx context.Context) error {
 CREATE TABLE IF NOT EXISTS links (
 	code TEXT PRIMARY KEY,
 	url TEXT NOT NULL,
+	clicks INTEGER NOT NULL DEFAULT 0,
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );`
 
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("initialize sqlite schema: %w", err)
+	}
+	if err := s.ensureClicksColumn(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ensureClicksColumn(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(links);`)
+	if err != nil {
+		return fmt.Errorf("inspect sqlite schema: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("scan sqlite schema: %w", err)
+		}
+		if name == "clicks" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate sqlite schema: %w", err)
+	}
+
+	const alter = `ALTER TABLE links ADD COLUMN clicks INTEGER NOT NULL DEFAULT 0;`
+	if _, err := s.db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("add clicks column: %w", err)
 	}
 	return nil
 }
@@ -72,14 +106,32 @@ func (s *SQLiteStore) Load(ctx context.Context, code string) (string, error) {
 
 // Get は code に対応するリンクのメタ情報を返します。
 func (s *SQLiteStore) Get(ctx context.Context, code string) (Link, error) {
-	const query = `SELECT code, url FROM links WHERE code = ?;`
+	const query = `SELECT code, url, clicks FROM links WHERE code = ?;`
 
 	var link Link
-	if err := s.db.QueryRowContext(ctx, query, code).Scan(&link.Code, &link.URL); err != nil {
+	if err := s.db.QueryRowContext(ctx, query, code).Scan(&link.Code, &link.URL, &link.Clicks); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Link{}, ErrNotFound
 		}
 		return Link{}, fmt.Errorf("get link: %w", err)
 	}
 	return link, nil
+}
+
+// IncrementClicks は code に対応するリンクのクリック数を 1 増やします。
+func (s *SQLiteStore) IncrementClicks(ctx context.Context, code string) error {
+	const query = `UPDATE links SET clicks = clicks + 1 WHERE code = ?;`
+
+	result, err := s.db.ExecContext(ctx, query, code)
+	if err != nil {
+		return fmt.Errorf("increment clicks: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read increment result: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

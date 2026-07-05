@@ -1,0 +1,395 @@
+---
+title: Day 4 - Go の並行処理とクリック統計
+description: goroutine、channel、select、race detector、graceful shutdown を使い、リダイレクトのクリック数を安全に集計する設計を学びます。
+sidebar:
+  label: Day 4
+  order: 4
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+## 今日のゴール
+
+- goroutine、channel、select の基本を説明できるようになる。
+- 「メモリを共有して通信するな、通信してメモリを共有せよ」の意味を、クリック統計の設計で理解する。
+- リダイレクト時のイベントを channel に送り、単一 goroutine で集計する流れを読めるようになる。
+- バッファ付き channel と、満杯時にイベントをドロップする理由を説明できるようになる。
+- data race を `go test -race` で検出し、mutex または channel で直す考え方を身につける。
+- mutex 案と channel 案の違いを、今回の URL 短縮サービスに即して比較できるようになる。
+- graceful shutdown が、デプロイやスケール時に重要になる理由を理解する。
+- `GET /api/links/{code}/stats` でクリック数を確認する。
+
+## 解説
+
+Day 3 では、保存先を `Storage` インターフェースとして切り出しました。Day 4 では、短縮 URL がクリックされた回数を記録します。クリック数は単なるカウンタに見えますが、HTTP サーバでは複数のリクエストが同時に動きます。何も考えずに共有変数を `clicks++` すると、data race や更新漏れが起きます。
+
+今回の実装では、リダイレクトのハンドラが直接クリック数を更新し続けるのではなく、クリックイベントを channel に送ります。裏側で 1 つの goroutine が channel からイベントを読み、`Storage` に反映します。
+
+```txt title="Day 4 のクリック集計の流れ"
+GET /{code}
+  -> storage.Load で元 URL を読む
+  -> analytics.Collector.Record(code) でイベントを送る
+  -> すぐ 302 Found を返す
+
+analytics.Collector の goroutine
+  -> channel から code を受け取る
+  -> storage.IncrementClicks(ctx, code) を呼ぶ
+
+GET /api/links/{code}/stats
+  -> storage.Get で code, url, clicks を返す
+```
+
+### goroutine は軽量な並行処理の単位
+
+goroutine は、Go の関数を並行に動かす仕組みです。`go f()` と書くと、`f` は呼び出し元とは別の goroutine として動きます。今回の実コードでは、`analytics.New` の中で集計用 goroutine を起動しています。
+
+```go title="app/internal/analytics/analytics.go"
+func New(store storage.Storage, buffer int) *Collector {
+	c := &Collector{
+		store:  store,
+		events: make(chan string, buffer),
+		done:   make(chan struct{}),
+	}
+	go c.run()
+	return c
+}
+```
+
+`events` はクリックされた短縮コードを流す channel です。`done` は、集計 goroutine が終了したことを知らせる channel です。`go c.run()` により、HTTP リクエストを処理する goroutine とは別に、集計専用の goroutine が動き始めます。
+
+```go title="app/internal/analytics/analytics.go"
+func (c *Collector) run() {
+	defer close(c.done)
+	for code := range c.events {
+		if err := c.store.IncrementClicks(context.Background(), code); err != nil {
+			c.failed.Add(1)
+		}
+	}
+}
+```
+
+`for code := range c.events` は、channel から値を受け取り続けます。`events` が閉じられるとループを抜け、最後に `done` を閉じます。HTTP リクエストが同時に何件来ても、集計 goroutine はイベントを 1 件ずつ取り出して処理します。
+
+### channel は goroutine 間で値を渡す道
+
+channel は、goroutine 同士で値を受け渡すための道です。今回の `events` は `chan string` なので、短縮コードの文字列を送れます。`Record` は、リダイレクトのハンドラから呼ばれる入口です。
+
+```go title="app/internal/analytics/analytics.go"
+func (c *Collector) Record(code string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed {
+		return false
+	}
+
+	select {
+	case c.events <- code:
+		return true
+	default:
+		c.dropped.Add(1)
+		return false
+	}
+}
+```
+
+`c.events <- code` が送信です。送信できたら `true`、送れなかったら `dropped` を増やして `false` を返します。`mu` は、`Close` と `Record` が同時に動いたとき、閉じた channel へ送信しないために使っています。channel を使っていても、周辺の状態である `closed` には排他制御が必要です。
+
+### select とバッファ付き channel
+
+`select` は、複数の channel 操作のうち、実行できるものを選びます。今回の `Record` では、送信できるなら送信し、送信できないなら `default` に進みます。`default` がある select は待ちません。channel に空きがあれば送信し、空きがなければ即座に `default` が実行されます。
+
+```go title="app/internal/analytics/analytics.go"
+select {
+case c.events <- code:
+	return true
+default:
+	c.dropped.Add(1)
+	return false
+}
+```
+
+`cmd/server/main.go` では、クリック集計をバッファ 1024 件で作っています。
+
+```go title="app/cmd/server/main.go"
+clicks := analytics.New(store, 1024)
+```
+
+バッファ付き channel は、受信側がすぐに受け取れなくても、バッファに空きがあれば送信できます。一瞬だけクリックが集中しても、集計 goroutine が順に処理していけます。ただし、バッファは無限ではありません。保存先が遅い、またはアクセスが急増した場合、1024 件のバッファが埋まることがあります。
+
+そのとき今回の実装は、リクエストを待たせずにイベントを捨てます。これは「クリック統計は多少欠けてもよい」という判断です。短縮 URL の本質的な機能は、利用者を元 URL へ素早くリダイレクトすることです。クリック数を 1 件も欠かさず記録するためにリダイレクトが詰まると、利用者体験も、上流のロードバランサから見たヘルスも悪くなります。
+
+金融取引や課金イベントなら別の設計が必要です。その場合は、永続キュー、リトライ、少なくとも一度の配送などを考えます。Day 4 のクリック統計は補助的な分析情報なので、可用性を優先してドロップ戦略を選んでいます。
+
+### 「通信してメモリを共有せよ」
+
+Go には「メモリを共有して通信するな、通信してメモリを共有せよ」という有名な考え方があります。複数の goroutine が同じ変数を直接触って連絡を取り合うのではなく、channel でメッセージを渡し、データの扱いを特定の goroutine に寄せよう、という意味です。
+
+今回の設計では、HTTP ハンドラがクリック数の内部状態を直接いじりません。ハンドラは `code` というイベントだけを channel に送ります。集計 goroutine がそれを受け取り、`Storage` の `IncrementClicks` を呼びます。
+
+```go title="app/internal/handler/handler.go"
+func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	originalURL, err := h.store.Load(r.Context(), code)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if h.clicks != nil {
+		h.clicks.Record(code)
+	}
+	http.Redirect(w, r, originalURL, http.StatusFound)
+}
+```
+
+`redirect` は、元 URL を読み、クリックイベントを送り、リダイレクトを返すだけです。クリック数の保存方法、バッファ、失敗数、ドロップ数は `analytics` パッケージに閉じています。この分離により、HTTP ハンドラの責務が軽くなります。後日、集計先を Redis、ログ、メッセージキューへ変えるとしても、ハンドラへの影響を小さくできます。
+
+### stats API と Storage の更新
+
+Day 4 では、クリック数を見るための API も追加されています。`GET /api/links/{code}/stats` は `store.Get` でリンクを読み、`clicks` を JSON に入れて返します。
+
+```go title="app/internal/handler/handler.go"
+mux.HandleFunc("GET /api/links/{code}/stats", h.getLinkStats)
+
+func (h *Handler) getLinkStats(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	link, err := h.store.Get(r.Context(), code)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, linkStatsResponse{
+		Code: link.Code, URL: link.URL, Clicks: link.Clicks,
+	})
+}
+```
+
+レスポンスは次の形です。
+
+```json
+{"code":"1","url":"https://example.com/articles/concurrency","clicks":1}
+```
+
+`Storage` インターフェースには、`IncrementClicks` が追加されています。メモリ保存では `map` の中の `Link` を取り出し、`Clicks` を増やして戻します。SQLite では `UPDATE links SET clicks = clicks + 1 WHERE code = ?` を実行します。`RowsAffected` が 0 なら、対象の短縮コードが存在しないので `ErrNotFound` を返します。
+
+```go title="app/internal/storage/storage.go"
+type Storage interface {
+	Save(ctx context.Context, code, url string) error
+	Load(ctx context.Context, code string) (string, error)
+	Get(ctx context.Context, code string) (Link, error)
+	IncrementClicks(ctx context.Context, code string) error
+}
+```
+
+### mutex 案と channel 案を比較する
+
+クリック数の実装には、ハンドラの中で `store.IncrementClicks` を直接呼ぶ mutex 案もあります。`MemoryStore` は `sync.RWMutex` で守られているので、この案でも data race は防げます。実装も短く、保存が成功すればクリックを取りこぼしにくいです。
+
+ただし、リダイレクトの応答時間が保存処理に引っ張られます。SQLite が一時的に遅い、将来 Postgres が混んでいる、ネットワーク越しの保存先で待ちが出る、という状況では、利用者がリダイレクトを待つことになります。
+
+```txt title="mutex 案と channel 案の比較"
+mutex 案
+  良い点: 実装が単純。成功すればクリックを取りこぼしにくい。
+  注意点: リダイレクトが保存処理の待ち時間を受ける。
+
+channel 案
+  良い点: リダイレクトをクリック集計の遅さから切り離せる。
+  注意点: バッファ満杯時にドロップする設計を受け入れる必要がある。
+```
+
+どちらが常に正しい、という話ではありません。今回のサービスでは、リダイレクトの速さと可用性を優先し、クリック統計は補助情報として非同期に扱っています。
+
+### race detector で data race を見つける
+
+data race は、複数の goroutine が同じメモリに同時にアクセスし、そのうち少なくとも 1 つが書き込みで、適切な同期がない状態です。Go には race detector があり、`go test -race` で実行できます。
+
+壊れる例を小さく書くと、次のようになります。
+
+```go title="/tmp/racy/racy_counter_test.go"
+package racy
+
+import (
+	"sync"
+	"testing"
+)
+
+func TestRacyCounter(t *testing.T) {
+	count := 0
+	var wg sync.WaitGroup
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			count++
+		}()
+	}
+	wg.Wait()
+	t.Log(count)
+}
+```
+
+`count++` は 1 命令ではありません。大まかには、読む、足す、書く、という複数の操作です。複数 goroutine が同時にここへ入ると、更新が失われたり、race detector に検出されたりします。
+
+```sh
+cd /tmp/racy
+go mod init racy
+go test -race
+```
+
+期待出力には、次のような警告が含まれます。
+
+```txt
+WARNING: DATA RACE
+Read at ...
+Previous write at ...
+```
+
+直す方法はいくつかあります。共有カウンタを mutex で守るなら、`mu.Lock()` と `mu.Unlock()` の間で `count++` します。今回のクリック統計のように、更新イベントを 1 つの goroutine に寄せるなら、channel で値を送る設計にします。どちらも、同期なしの共有メモリアクセスをなくしている点が重要です。
+
+### graceful shutdown は安全に止めるための作法
+
+Day 4 では、サーバの止め方も変わっています。`http.Server` を作り、シグナルを受け取ったら `Shutdown` します。
+
+```go title="app/cmd/server/main.go"
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+errCh := make(chan error, 1)
+go func() {
+	log.Printf("shortlink server listening on %s", addr)
+	errCh <- server.ListenAndServe()
+}()
+```
+
+`signal.NotifyContext` は、`Ctrl+C` の `os.Interrupt` や、コンテナ停止時によく送られる `SIGTERM` を context のキャンセルとして扱います。サーバ本体は goroutine で起動し、メイン goroutine は「サーバがエラーで終わるか」「シグナルが来るか」を待ちます。
+
+`server.Shutdown` は、新しい接続の受付を止め、処理中のリクエストが終わるのを待ちます。今回のタイムアウトは `5 * time.Second` です。永遠に待ち続けないように、`context.WithTimeout` を渡しています。その後、`clicks.Close` で `events` channel を閉じ、キュー済みのイベントが処理されるまで `done` を待ちます。
+
+Docker や Kubernetes では、古いプロセスを止めて新しいプロセスへ入れ替える場面が何度も出てきます。停止シグナルを受けた瞬間にプロセスを落とすと、処理中のリクエストが切れたり、channel に残っていたクリックイベントが失われたりします。
+
+graceful shutdown は、止めることを前提にした設計です。新しいリクエストは受けない。いま処理しているリクエストはできるだけ終わらせる。裏側のキューも、期限内でできるだけ流し切る。この作法があると、ローリングデプロイや水平スケールでプロセスが入れ替わるときにも、利用者への影響を小さくできます。
+
+## 手を動かす
+
+まず、race detector 付きでアプリのテストを実行します。
+
+```sh
+cd app
+go test -race ./...
+```
+
+期待出力は、各パッケージが `ok` になる形です。`cmd/server` はテストファイルがないので `[no test files]` と表示されます。
+
+```txt
+?   	github.com/study-backend-scale/shortlink/cmd/server	[no test files]
+ok  	github.com/study-backend-scale/shortlink/internal/analytics	...
+ok  	github.com/study-backend-scale/shortlink/internal/handler	...
+ok  	github.com/study-backend-scale/shortlink/internal/shortener	...
+ok  	github.com/study-backend-scale/shortlink/internal/storage	...
+```
+
+次に、ターミナルを 2 つ使ってクリック統計を確認します。1 つ目でサーバを起動します。
+
+```sh
+go run ./cmd/server
+```
+
+期待するログは次の形です。
+
+```txt
+shortlink server listening on :8080
+```
+
+別のターミナルで、短縮リンクを作ります。
+
+```sh
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/articles/concurrency"}'
+```
+
+サーバ起動後の最初の作成なら、期待出力は次の形です。
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: http://localhost:8080/1
+
+{"code":"1","short_url":"http://localhost:8080/1"}
+```
+
+まだリダイレクトしていないので、統計は 0 です。
+
+```sh
+curl -i http://localhost:8080/api/links/1/stats
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"code":"1","url":"https://example.com/articles/concurrency","clicks":0}
+```
+
+次に、短縮 URL を 3 回クリックしたことにします。
+
+```sh
+curl -i http://localhost:8080/1
+curl -i http://localhost:8080/1
+curl -i http://localhost:8080/1
+```
+
+各レスポンスは `302 Found` で、`Location` に元 URL が入ります。
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/articles/concurrency
+```
+
+もう一度 stats を見ます。
+
+```sh
+curl -i http://localhost:8080/api/links/1/stats
+```
+
+期待出力は、クリック数が 3 になっている形です。
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"code":"1","url":"https://example.com/articles/concurrency","clicks":3}
+```
+
+クリック集計は非同期です。通常はすぐ反映されますが、保存先が遅い場合や高負荷時には、リダイレクト直後の stats が一瞬だけ古い値を返す可能性があります。これは今回の「リダイレクトを止めない」設計の性質です。
+
+最後に、1 つ目のターミナルで `Ctrl+C` を押して止めます。このとき `signal.NotifyContext` がシグナルを受け、`server.Shutdown` と `clicks.Close` が走ります。
+
+## クイズ
+
+<Quiz question="バッファ付き channel が満杯のとき、default なしで送信すると何が起きますか？" choices={['バッファに空きが出るまで送信側が待つ', '古い値が自動で上書きされる', 'Go ランタイムが勝手に channel を拡張する', '必ず panic する']} answer={0} explanation="バッファ付き channel でも容量は有限です。満杯の channel へ default なしで送信すると、受信されて空きができるまで送信側はブロックします。" />
+
+<Quiz question="data race の説明として正しいものはどれですか？" choices={['複数 goroutine が同じメモリへ同期なしにアクセスし、少なくとも 1 つが書き込みである状態', 'HTTP リクエストが 404 を返す状態', 'テストケースの実行順がランダムになる状態', 'SQLite のテーブルが存在しない状態']} answer={0} explanation="data race は、同じメモリへの並行アクセスに適切な同期がなく、そのうち少なくとも 1 つが書き込みである状態です。Go では go test -race で検出できます。" />
+
+<Quiz question="select で複数の case が同時に ready の場合、Go はどうしますか？" choices={['ready な case の中から疑似ランダムに 1 つを選ぶ', '必ず一番上の case を選ぶ', 'すべての case を上から順に実行する', 'コンパイルエラーになる']} answer={0} explanation="select は、実行可能な case が複数ある場合、その中から疑似ランダムに 1 つを選びます。順序に依存した制御を書かないようにします。" />
+
+<Quiz question="http.Server.Shutdown が主に待つものはどれですか？" choices={['新しい接続の受付を止めたうえで、処理中のリクエストが完了すること', 'OS の再起動が完了すること', 'すべてのログファイルが圧縮されること', 'ブラウザがキャッシュを消すこと']} answer={0} explanation="Shutdown は新しい接続の受付を止め、処理中のリクエストが終わるのを context の期限まで待ちます。今回のクリック集計の終了待ちは、その後に clicks.Close で行っています。" />
+
+<Quiz question="今回のクリック統計で、バッファ満杯時にイベントをドロップする主な理由はどれですか？" choices={['リダイレクトの応答をクリック集計の遅さでブロックしないため', 'クリック数を常に 0 にしたいから', 'Storage インターフェースを使わないため', 'HTTP では 302 にボディを付けられないから']} answer={0} explanation="クリック統計は補助情報なので、満杯時はイベントを捨ててでもリダイレクトを素早く返す設計にしています。何を優先するかを要件に合わせて決めることが重要です。" />
+
+## 今日のまとめ
+
+今日は、Go の並行処理を使ってクリック統計を実装しました。リダイレクトのハンドラは、クリック数を直接更新するのではなく、`analytics.Collector.Record` で channel にイベントを送ります。裏側の単一 goroutine が `Storage.IncrementClicks` を呼び、クリック数を保存します。
+
+この設計は、「メモリを共有して通信するな、通信してメモリを共有せよ」という Go の考え方を、URL 短縮サービスに当てはめたものです。HTTP ハンドラが共有状態を直接いじるのではなく、イベントを送ることで責務を分けています。
+
+バッファ付き channel は、一時的なクリック集中を吸収できます。ただし満杯になることはあり、そのとき今回の実装はイベントをドロップします。リダイレクトの速さを優先するためです。mutex 案は単純で取りこぼしにくい一方、保存処理の遅さをリクエストが受けます。channel 案は非同期にできる一方、ドロップや反映遅延を設計として受け入れる必要があります。
+
+race detector では、同期なしの共有メモリアクセスを検出できます。`go test -race ./...` は、並行処理を含む Go アプリでは習慣にしたい確認です。
+
+最後に、graceful shutdown を導入しました。`signal.NotifyContext` で停止シグナルを受け、`http.Server.Shutdown` で処理中のリクエストを待ち、`clicks.Close` でキュー済みイベントを流し切ります。デプロイやスケールではプロセスの停止と入れ替えが日常的に起きるため、安全に止める設計が重要になります。
+
+## 明日の予告
+
+Day 5 では、いよいよ Docker でアプリをコンテナ化します。今日までに作った Go サーバを、手元の `go run` だけでなく、どこでも同じように動かせるイメージへ包みます。
+
+multi-stage build、distroless、`CGO_ENABLED=0`、非 root 実行を扱います。「自分のマシンでは動く」から一歩進んで、「同じ成果物をデプロイできる」形へ進みます。

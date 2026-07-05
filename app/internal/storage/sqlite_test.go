@@ -27,7 +27,7 @@ func TestSQLiteStoreSaveLoadAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get returned error: %v", err)
 	}
-	if gotLink != (Link{Code: "abc", URL: "https://example.com/articles/1"}) {
+	if gotLink != (Link{Code: "abc", URL: "https://example.com/articles/1", Clicks: 0}) {
 		t.Fatalf("Get = %#v, want saved link", gotLink)
 	}
 }
@@ -57,6 +57,36 @@ func TestSQLiteStoreOverwrite(t *testing.T) {
 	}
 	if got != "https://new.example.com" {
 		t.Fatalf("Load returned %q, want overwritten URL", got)
+	}
+}
+
+func TestSQLiteStoreIncrementClicks(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	ctx := context.Background()
+
+	if err := store.Save(ctx, "abc", "https://example.com/articles/1"); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := store.IncrementClicks(ctx, "abc"); err != nil {
+			t.Fatalf("IncrementClicks returned error: %v", err)
+		}
+	}
+
+	got, err := store.Get(ctx, "abc")
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if got.Clicks != 3 {
+		t.Fatalf("Clicks = %d, want 3", got.Clicks)
+	}
+}
+
+func TestSQLiteStoreIncrementClicksMissing(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	if err := store.IncrementClicks(context.Background(), "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("IncrementClicks returned %v, want ErrNotFound", err)
 	}
 }
 

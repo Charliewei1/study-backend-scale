@@ -11,8 +11,9 @@ var ErrNotFound = errors.New("link not found")
 
 // Link は保存済みリンクのメタ情報です。
 type Link struct {
-	Code string
-	URL  string
+	Code   string
+	URL    string
+	Clicks int64
 }
 
 // Storage は保存先を差し替えるためのインターフェースです。
@@ -23,4 +24,5 @@ type Storage interface {
 	Save(ctx context.Context, code, url string) error
 	Load(ctx context.Context, code string) (string, error)
 	Get(ctx context.Context, code string) (Link, error)
+	IncrementClicks(ctx context.Context, code string) error
 }

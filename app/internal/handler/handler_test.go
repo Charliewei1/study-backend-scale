@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/study-backend-scale/shortlink/internal/analytics"
 	"github.com/study-backend-scale/shortlink/internal/shortener"
 	"github.com/study-backend-scale/shortlink/internal/storage"
 )
@@ -16,7 +18,7 @@ const testBaseURL = "http://example.test"
 
 func newTestHandler() (http.Handler, *storage.MemoryStore) {
 	store := storage.NewMemoryStore()
-	return New(shortener.New(), store, testBaseURL), store
+	return New(shortener.New(), store, testBaseURL, nil), store
 }
 
 func TestCreateLink(t *testing.T) {
@@ -236,6 +238,53 @@ func TestRedirect(t *testing.T) {
 				assertJSONBody(t, rec.Body.String(), tt.wantBody)
 			}
 		})
+	}
+}
+
+func TestLinkStatsAfterRedirect(t *testing.T) {
+	store := storage.NewMemoryStore()
+	clicks := analytics.New(store, 8)
+	h := New(shortener.New(), store, testBaseURL, clicks)
+
+	if err := store.Save(context.Background(), "abc", "https://example.com/articles/1"); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	redirectReq := httptest.NewRequest(http.MethodGet, "/abc", nil)
+	redirectRec := httptest.NewRecorder()
+	h.ServeHTTP(redirectRec, redirectReq)
+	if redirectRec.Code != http.StatusFound {
+		t.Fatalf("redirect status = %d, want %d; body=%s", redirectRec.Code, http.StatusFound, redirectRec.Body.String())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := clicks.Close(ctx); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	statsReq := httptest.NewRequest(http.MethodGet, "/api/links/abc/stats", nil)
+	statsRec := httptest.NewRecorder()
+	h.ServeHTTP(statsRec, statsReq)
+
+	if statsRec.Code != http.StatusOK {
+		t.Fatalf("stats status = %d, want %d; body=%s", statsRec.Code, http.StatusOK, statsRec.Body.String())
+	}
+	if got := statsRec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+
+	var got linkStatsResponse
+	if err := json.Unmarshal(statsRec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response body is not JSON: %v; body=%s", err, statsRec.Body.String())
+	}
+	want := linkStatsResponse{
+		Code:   "abc",
+		URL:    "https://example.com/articles/1",
+		Clicks: 1,
+	}
+	if got != want {
+		t.Fatalf("stats = %#v, want %#v", got, want)
 	}
 }
 
