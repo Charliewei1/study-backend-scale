@@ -8,6 +8,10 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+:::note[このページのコードについて]
+このページは Day 6 時点のコードを解説しています。当時のコードは `git checkout day06` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+:::
+
 ## 今日のゴール
 
 - なぜ SQLite から Postgres へ進むのかを、同時書き込み、ネットワーク越し共有、将来の複数レプリカと結びつけて説明できるようになる。
@@ -298,16 +302,16 @@ curl -s -X POST http://localhost:8080/api/links \
 ```
 
 期待出力は次のような JSON です。
-最初の作成なら `code` は `0` になります。
+最初の作成なら `code` は `1` になります。
 
 ```json
-{"code":"0","short_url":"http://localhost:8080/0"}
+{"code":"1","short_url":"http://localhost:8080/1"}
 ```
 
 リダイレクトを確認します。
 
 ```sh
-curl -i http://localhost:8080/0
+curl -i http://localhost:8080/1
 ```
 
 期待出力では、`302 Found` と `Location` ヘッダーが見えます。
@@ -334,7 +338,7 @@ docker compose restart app
 再起動後、同じコードをもう一度確認します。
 
 ```sh
-curl -i http://localhost:8080/0
+curl -i http://localhost:8080/1
 ```
 
 期待出力は、再起動前と同じく `302 Found` です。
@@ -363,7 +367,7 @@ docker compose down -v
 ```
 
 `down -v` のあとにもう一度起動すると、Postgres は空の状態から始まります。
-今日の確認で使った `code=0` は消えています。
+今日の確認で使った `code=1` は消えています。
 再起動では残り、volume 削除では消える。
 この違いを体で覚えておきましょう。
 

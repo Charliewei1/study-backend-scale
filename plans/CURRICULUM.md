@@ -66,7 +66,7 @@
 - クイズ例: counter と gauge / rate() の意味 / RED の R・E・D。
 
 ## Day 13 — レートリミットと回復性
-- コード: `internal/middleware/ratelimit.go`(token bucket、`golang.org/x/time/rate`、クライアント IP 別、`X-RateLimit-*` ヘッダ、429)。タイムアウト設計(`http.Server` の Read/Write timeout、ハンドラの context timeout、DB/Redis 呼び出しのタイムアウト)。リトライ+指数バックオフの解説(コードは Redis 接続で例示)。`load/day13-ratelimit.js` で 429 を観察。
+- コード: `internal/middleware/ratelimit.go`(token bucket、`golang.org/x/time/rate`、クライアント IP 別、`X-RateLimit-*` ヘッダ、429)。タイムアウト設計(`http.Server` の ReadHeader/Read/Write/Idle timeout を main.go に設定、ハンドラの context timeout、DB/Redis 呼び出しのタイムアウト)。リクエストボディの防御: `http.MaxBytesReader` でサイズ上限 + `DisallowUnknownFields`(レビュー指摘の回収)。リトライ+指数バックオフの解説(コードは Redis 接続で例示)。`load/day13-ratelimit.js` で 429 を観察。
 - 教材: なぜ守りが要るか(自衛としてのレートリミット、カスケード障害)、token bucket vs sliding window、タイムアウトの連鎖設計、サーキットブレーカー概念、graceful degradation(Redis 死→DB 直行は Day8 で実装済み、を回収)。
 - クイズ例: token bucket の burst / 429 と Retry-After / タイムアウトを内側ほど短くする理由。
 
@@ -78,3 +78,4 @@
 ## Day 15 — 総仕上げ: フルスタックデプロイと最終計測
 - 資産: `deploy/k8s/full/` に全部載せ(app + postgres + redis + HPA + monitoring は compose 併用でも可)を kustomize なしの素朴な YAML 一式で。`load/day15-final.js`(day07 と同条件)+ 総合レポートページ: Day7 ベースライン → Day8 キャッシュ → Day11 スケールの数値変化まとめ(教材内に例示値の表)。全体アーキテクチャ図(mermaid)。卒業クイズ 10 問。今後の学習ロードマップ(gRPC, service mesh, Kafka, マネージド k8s…)。
 - 教材: 15 日の総復習ストーリー(1 バイナリ → コンテナ → オーケストレーション → 計測駆動改善)、「スケーラビリティとは負荷に比例してリソースを足せば性能が伸びる性質」の再定義。
+- サイト仕上げ: サイドバーを手動構成にし「基礎(1-4)/コンテナ(5-6)/計測とキャッシュ(7-8)/Kubernetes(9-11)/運用と分散(12-14)/総仕上げ(15)」のグループ分け+各項目にテーマ名。index.mdx の全日リンク確認。

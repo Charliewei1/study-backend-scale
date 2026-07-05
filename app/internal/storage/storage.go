@@ -9,6 +9,9 @@ import (
 // ErrNotFound は指定された短縮コードが保存先に存在しないことを表します。
 var ErrNotFound = errors.New("link not found")
 
+// ErrConflict は指定された短縮コードがすでに保存先に存在することを表します。
+var ErrConflict = errors.New("link code already exists")
+
 // Link は保存済みリンクのメタ情報です。
 type Link struct {
 	Code   string
@@ -21,6 +24,7 @@ type Link struct {
 // context.Context を受け取ることで、HTTP リクエストのキャンセルや将来の
 // タイムアウト設定を storage 層まで伝播できます。
 type Storage interface {
+	Ping(ctx context.Context) error
 	Save(ctx context.Context, code, url string) error
 	Load(ctx context.Context, code string) (string, error)
 	Get(ctx context.Context, code string) (Link, error)

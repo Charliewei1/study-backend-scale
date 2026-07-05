@@ -1,0 +1,91 @@
+# 教材用の素朴な PostgreSQL Deployment です。
+# 本番では StatefulSet、バックアップ、認証情報管理、監視などを別途設計します。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: shortlink
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/instance: shortlink
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: study-backend-scale
+spec:
+  # ReadWriteOnce の PVC を 1 Pod から使うため、replicas は 1 に固定します。
+  replicas: 1
+  # Recreate は古い Pod を止めてから新しい Pod を作ります。
+  # PVC を共有する PostgreSQL Pod が更新時に二重起動しないための教材用設定です。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/instance: shortlink
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/instance: shortlink
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: study-backend-scale
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            # 以下は教材用のダミー値です。本物のパスワードは manifest に直書きしません。
+            - name: POSTGRES_DB
+              value: shortlink
+            - name: POSTGRES_USER
+              value: shortlink
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            # PVC のマウント直下ではなくサブディレクトリをデータ領域にします。
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          # pg_isready は接続受付可能になるまで readiness を失敗させます。
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - shortlink
+                - -d
+                - shortlink
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          # liveness は PostgreSQL プロセスが応答不能になった時だけ再起動します。
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - shortlink
+                - -d
+                - shortlink
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-data

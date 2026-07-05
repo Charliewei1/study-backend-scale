@@ -49,15 +49,27 @@ func (s *PostgresStore) Close() {
 	s.pool.Close()
 }
 
+// Ping は PostgreSQL 接続プールから DB へ疎通できるかを確認します。
+func (s *PostgresStore) Ping(ctx context.Context) error {
+	if err := s.pool.Ping(ctx); err != nil {
+		return fmt.Errorf("ping postgres: %w", err)
+	}
+	return nil
+}
+
 // Save は code と url の対応を PostgreSQL に保存します。
 func (s *PostgresStore) Save(ctx context.Context, code, url string) error {
 	const query = `
 INSERT INTO links (code, url)
 VALUES ($1, $2)
-ON CONFLICT (code) DO UPDATE SET url = excluded.url;`
+ON CONFLICT (code) DO NOTHING;`
 
-	if _, err := s.pool.Exec(ctx, query, code, url); err != nil {
+	tag, err := s.pool.Exec(ctx, query, code, url)
+	if err != nil {
 		return fmt.Errorf("save link: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
 	}
 	return nil
 }

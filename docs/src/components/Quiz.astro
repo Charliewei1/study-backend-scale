@@ -16,12 +16,22 @@ if (!Number.isInteger(answer) || answer < 0 || answer >= choices.length) {
 
 <section class="quiz" data-quiz data-answer={answer} aria-labelledby={quizId}>
   <p id={quizId} class="quiz__question">{question}</p>
-  <div class="quiz__choices" role="list">
+  <div class="quiz__choices" role="radiogroup" aria-labelledby={quizId}>
     {
       choices.map((choice, index) => (
-        <button class="quiz__choice" type="button" data-choice={index} aria-pressed="false">
+        <button
+          class="quiz__choice"
+          type="button"
+          role="radio"
+          data-choice={index}
+          aria-checked="false"
+          tabindex={index === 0 ? '0' : '-1'}
+        >
           <span class="quiz__choice-marker">{String.fromCharCode(65 + index)}</span>
-          <span>{choice}</span>
+          <span class="quiz__choice-content">
+            <span>{choice}</span>
+            <span class="quiz__choice-status" data-choice-status hidden></span>
+          </span>
         </button>
       ))
     }
@@ -40,24 +50,82 @@ if (!Number.isInteger(answer) || answer < 0 || answer >= choices.length) {
     const result = root.querySelector<HTMLElement>('[data-result]');
     const explanation = root.querySelector<HTMLElement>('[data-explanation]');
 
-    choices.forEach((button) => {
+    const moveFocus = (index: number) => {
+      const target = choices[index];
+      if (!target) return;
+
+      choices.forEach((choice) => {
+        choice.tabIndex = choice === target ? 0 : -1;
+      });
+      target.focus();
+    };
+
+    const setStatusLabel = (choice: HTMLElement, label: string) => {
+      const status = choice.querySelector<HTMLElement>('[data-choice-status]');
+      if (!status) return;
+
+      status.textContent = label;
+      status.hidden = label.length === 0;
+    };
+
+    const submitChoice = (button: HTMLButtonElement) => {
+      const selected = Number(button.dataset.choice);
+      const isCorrect = selected === answer;
+
+      choices.forEach((choice) => {
+        const choiceIndex = Number(choice.dataset.choice);
+        choice.setAttribute('aria-checked', String(choiceIndex === selected));
+        choice.tabIndex = choice === button ? 0 : -1;
+        choice.dataset.state = choiceIndex === answer ? 'correct' : choiceIndex === selected ? 'incorrect' : 'neutral';
+        setStatusLabel(
+          choice,
+          choiceIndex === answer ? '✓ 正解' : choiceIndex === selected ? 'あなたの回答' : ''
+        );
+      });
+
+      if (result) {
+        result.textContent = isCorrect ? '正解です。' : '不正解です。正解の選択肢を確認しましょう。';
+        result.dataset.state = isCorrect ? 'correct' : 'incorrect';
+      }
+
+      if (explanation) {
+        explanation.hidden = false;
+      }
+    };
+
+    choices.forEach((button, index) => {
       button.addEventListener('click', () => {
-        const selected = Number(button.dataset.choice);
-        const isCorrect = selected === answer;
+        submitChoice(button);
+      });
 
-        choices.forEach((choice) => {
-          const choiceIndex = Number(choice.dataset.choice);
-          choice.setAttribute('aria-pressed', String(choiceIndex === selected));
-          choice.dataset.state = choiceIndex === answer ? 'correct' : choiceIndex === selected ? 'incorrect' : 'neutral';
-        });
-
-        if (result) {
-          result.textContent = isCorrect ? '正解です。' : '不正解です。正解の選択肢を確認しましょう。';
-          result.dataset.state = isCorrect ? 'correct' : 'incorrect';
+      button.addEventListener('keydown', (event) => {
+        if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
+          event.preventDefault();
+          moveFocus((index + 1) % choices.length);
+          return;
         }
 
-        if (explanation) {
-          explanation.hidden = false;
+        if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
+          event.preventDefault();
+          moveFocus((index - 1 + choices.length) % choices.length);
+          return;
+        }
+
+        if (event.key === 'Home') {
+          event.preventDefault();
+          moveFocus(0);
+          return;
+        }
+
+        if (event.key === 'End') {
+          event.preventDefault();
+          moveFocus(choices.length - 1);
+          return;
+        }
+
+        if (event.key === ' ' || event.key === 'Enter') {
+          event.preventDefault();
+          submitChoice(button);
         }
       });
     });
@@ -119,6 +187,15 @@ if (!Number.isInteger(answer) || answer < 0 || answer >= choices.length) {
     border-radius: 999px;
     background: var(--sl-color-gray-6, #e2e8f0);
     color: var(--sl-color-gray-1, #0f172a);
+    font-weight: 700;
+  }
+
+  .quiz__choice-content {
+    display: grid;
+    gap: 0.25rem;
+  }
+
+  .quiz__choice-status {
     font-weight: 700;
   }
 

@@ -8,6 +8,10 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+:::note[このページのコードについて]
+このページは Day 7 時点のコードを解説しています。当時のコードは `git checkout day07` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+:::
+
 ## 今日のゴール
 
 - 「推測するな、計測せよ」という姿勢を、スケール改善の出発点として説明できるようになる。
@@ -39,6 +43,8 @@ Day 6 では、Docker Compose で Go アプリと Postgres を一緒に起動し
 ベースラインは、改善前の基準値です。
 今日のアプリは、Redis キャッシュも Kubernetes の複数レプリカもまだない、Compose で起動した app + Postgres 構成です。
 この状態で負荷試験を実行し、リクエスト数、失敗率、レイテンシを記録します。
+現在の `deploy/compose.yaml` には Day 8 で Redis が追加されています。
+Day 7 のベースラインを再現するときは、`REDIS_ADDR` を空にしてキャッシュなしで起動します。
 改善は、比較できて初めて改善です。
 Day 8 の Redis キャッシュ、Day 11 の複数レプリカや HPA でも、今日の数値が比較の物差しになります。
 
@@ -171,6 +177,7 @@ POST 側では `201` と `code` の存在を確認し、GET 側では `302` と 
 ### 今日の実測値
 
 このリポジトリで、Compose + Postgres 構成を起動し、2 分間の `ramping-vus` で 0 VU から 20 VU、50 VU、0 VU と負荷をかけた実測値は次の通りです。
+この値は Redis 導入前、つまりキャッシュなしの app + Postgres 構成で計測したものです。
 
 ```txt title="Day 7 baseline 実測値"
 http_reqs......................: 3250   26.97/s
@@ -256,6 +263,17 @@ cd deploy
 docker compose up -d --build
 ```
 
+現在の `compose.yaml` では Redis も定義済みです。
+Day 7 のベースラインとして測るため、app だけを止め、`REDIS_ADDR` を空に上書きして起動し直します。
+
+```sh
+docker compose stop app
+docker compose run --rm --service-ports -e REDIS_ADDR= app
+```
+
+このコマンドは実行中のままにし、別ターミナルで以降の `curl` と `k6` を実行します。
+同じ意図で、`deploy/compose.yaml` の app 環境変数から `REDIS_ADDR` を一時的にコメントアウトして `docker compose up -d --build` しても構いません。
+
 ヘルスチェックで、アプリが起動していることを確認します。
 
 ```sh
@@ -319,6 +337,7 @@ http_reqs......................: 3250   26.97/s
 pprof も開いてみます。
 通常の Compose 起動では `DEBUG_ADDR` を有効にしていないため、いったん app だけ止め、同じ Compose ネットワーク上でデバッグポート付きの app を起動します。
 Postgres は起動したままにします。
+上の `docker compose run --rm --service-ports -e REDIS_ADDR= app` を実行中の場合は、そのターミナルで `Ctrl+C` してから進めます。
 
 ```sh
 cd deploy

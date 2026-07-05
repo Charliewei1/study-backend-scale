@@ -10,7 +10,7 @@
 // 見るべき指標:
 //   - http_req_duration p(95): Redis キャッシュ導入前後で比較する。
 //   - http_req_failed: HTTP 失敗率。1% 未満を期待する。
-//   - GET /api/cache/stats: ヒット/ミス数を見てキャッシュが効いているか確認する。
+//   - 測定後に curl で /api/cache/stats を確認し、ヒット/ミス数を見る。
 
 import http from 'k6/http';
 import { check, fail, sleep } from 'k6';
@@ -30,6 +30,7 @@ export const options = {
   },
   thresholds: {
     http_req_duration: ['p(95)<100'],
+    'http_req_duration{name:redirect}': ['p(95)<100'],
     http_req_failed: ['rate<0.01'],
   },
 };
@@ -57,7 +58,7 @@ export function setup() {
   const links = [];
 
   for (let i = 0; i < 100; i += 1) {
-    const url = `https://example.com/day08/seed/${i}`;
+    const url = `https://example.com/load/seed/${i}`;
     const res = createLink(url);
     const code = responseCode(res);
     const ok = check(res, {
@@ -79,25 +80,25 @@ export function setup() {
 }
 
 export default function (data) {
-  if (Math.random() < 0.9) {
-    const link = data.links[Math.floor(Math.random() * data.links.length)];
-    const res = http.get(`${BASE_URL}/${link.code}`, {
-      redirects: 0,
-      tags: { name: 'GET /{code}' },
-    });
-
-    check(res, {
-      'redirect returns 302': (r) => r.status === 302,
-      'redirect location matches': (r) => r.headers.Location === link.url,
-    });
-  } else {
-    const url = `https://example.com/day08/new/${__VU}/${__ITER}`;
+  if (__ITER % 10 === 0) {
+    const url = `https://example.com/load/new/${__VU}/${__ITER}`;
     const res = createLink(url);
     const code = responseCode(res);
 
     check(res, {
       'create returns 201': (r) => r.status === 201,
       'create has code': () => Boolean(code),
+    });
+  } else {
+    const link = data.links[__ITER % data.links.length];
+    const res = http.get(`${BASE_URL}/${link.code}`, {
+      redirects: 0,
+      tags: { name: 'redirect' },
+    });
+
+    check(res, {
+      'redirect returns 302': (r) => r.status === 302,
+      'redirect location matches': (r) => r.headers.Location === link.url,
     });
   }
 

@@ -1,0 +1,393 @@
+---
+title: "Day 10 - k8s 設定・ヘルスチェック・ローリング更新"
+description: Kubernetes の ConfigMap、Secret、liveness/readiness probe、resources、RollingUpdate、教材用 PostgreSQL manifest を学びます。
+sidebar:
+  label: Day 10
+  order: 10
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+:::note[このページのコードについて]
+このページは Day 10 時点のコードを解説しています。当時のコードは `git checkout day10` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+:::
+
+## 今日のゴール
+
+- liveness probe と readiness probe の違いを説明できるようになる。
+- `/healthz` と `/readyz` の違いを、プロセス生存と依存先疎通に分けて読めるようになる。
+- ConfigMap と Secret を環境変数として Pod に注入する方法を理解する。
+- Secret は base64 表現であり、それだけでは暗号化ではないと説明できるようになる。
+- resources の requests、limits、QoS クラスの関係を理解する。
+- `maxSurge: 1`、`maxUnavailable: 0`、readiness が連携して無停止更新に近づく仕組みを説明できるようになる。
+- Kubernetes 内の教材用 PostgreSQL 構成を、Deployment、PVC、Service、Secret に分けて読めるようになる。
+
+## 解説
+
+Day 9 では、kind クラスタに shortlink を Deployment と Service で動かしました。
+今日は、その Deployment をもう少し運用に近づけます。
+設定値を ConfigMap と Secret に分け、probe で状態を見て、resources で資源の予約と上限を書き、RollingUpdate で Pod を 1 台ずつ入れ替えます。
+
+今日の中心は、「プロセスが生きている」と「リクエストを受けてよい」は別だと理解することです。
+DB が一時的に準備できていない Pod は、再起動するより Service の転送先から外すほうが自然です。
+一方で、プロセス自体が固まった Pod は再起動してほしい。
+この違いを Kubernetes では liveness と readiness に分けて表現します。
+
+### 今日使うファイル
+
+Day 10 では、`deploy/k8s/base/01-configmap.yaml`、`02-secret.yaml`、`deployment.yaml` と、`deploy/k8s/postgres/` 一式を読みます。
+`base/` はアプリ本体、`postgres/` は Kubernetes 内に教材用 PostgreSQL を立てる追加構成です。
+本番なら StatefulSet、バックアップ、監視、認証情報管理まで設計しますが、今日は単純な Deployment + PVC で学びます。
+
+### ConfigMap は機密ではない設定
+
+`deploy/k8s/base/01-configmap.yaml` は、アプリに渡す通常の設定値を持ちます。
+
+```yaml title="deploy/k8s/base/01-configmap.yaml"
+data:
+  PORT: "8080"
+  STORAGE: memory
+  SQLITE_PATH: /data/shortlink.db
+```
+
+ConfigMap は、機密ではない設定を Pod に渡すリソースです。
+`base/` では `STORAGE=memory` です。
+Day 9 と同じく、まずはアプリ Pod、Service、probe の動きに集中します。
+
+Deployment では `valueFrom.configMapKeyRef` で ConfigMap のキーを環境変数にします。
+
+```yaml title="deploy/k8s/base/deployment.yaml"
+- name: STORAGE
+  valueFrom:
+    configMapKeyRef:
+      name: shortlink-config
+      key: STORAGE
+```
+
+アプリコードは、これまで通り環境変数を読みます。
+Kubernetes 専用の設定読み込みを足しているわけではありません。
+コンテナは環境変数で設定する、という Day 5 からの流れがここでも効いています。
+
+### Secret は機密値を分けるための入れ物
+
+`deploy/k8s/base/02-secret.yaml` は `DATABASE_URL` を持ちます。
+
+```yaml title="deploy/k8s/base/02-secret.yaml"
+type: Opaque
+stringData:
+  DATABASE_URL: postgres://shortlink:shortlink_password@postgres:5432/shortlink?sslmode=disable
+```
+
+Deployment 側では `secretKeyRef` で参照します。
+
+```yaml title="deploy/k8s/base/deployment.yaml"
+- name: DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+      name: shortlink-secret
+      key: DATABASE_URL
+```
+
+Secret は接続文字列やパスワードを ConfigMap と分けるためのリソースです。
+ただし、Secret に入れた値は通常 base64 で表現されるだけです。
+base64 は暗号化ではありません。
+復号鍵がなくても元の文字列に戻せます。
+本番では、RBAC、etcd 暗号化、外部 Secret Manager なども合わせて考えます。
+
+### /healthz はプロセスの生存確認
+
+アプリ側の `/healthz` は liveness 用です。
+`app/internal/handler/handler.go` の `healthz` は `Content-Type` を設定し、`ok` を返すだけで、DB や Redis のような外部依存には触りません。
+
+liveness probe は「このコンテナを再起動すべきか」を判断します。
+もし liveness で DB まで見てしまうと、DB 障害のたびにアプリ Pod が再起動されます。
+DB が落ちている原因はアプリ再起動では直らないため、再起動ループに入りやすくなります。
+
+### /readyz は依存先まで含めた受付可否
+
+`/readyz` は readiness 用です。
+`app/internal/handler/handler.go` の `readyz` は `h.store.Ping(r.Context())` を呼び、失敗したら `503 storage unavailable`、成功したら `ok` を返します。
+
+`Storage` インターフェースには `Ping(ctx context.Context) error` が追加されています。
+MemoryStore の `Ping` は外部依存がないため常に成功します。
+PostgresStore の `Ping` は、`app/internal/storage/postgres.go` で接続プールから PostgreSQL へ疎通できるか確認します。
+
+readiness が失敗している Pod は Service の転送先から外れます。
+重要なのは、readiness 失敗だけではコンテナは再起動されないことです。
+liveness は再起動判断、readiness はトラフィック制御です。
+
+### Deployment の probe 設定
+
+`deploy/k8s/base/deployment.yaml` では、liveness と readiness が別々のパスを見ています。
+
+```yaml title="deploy/k8s/base/deployment.yaml"
+livenessProbe:
+  httpGet: { path: /healthz, port: http }
+  initialDelaySeconds: 5
+  periodSeconds: 10
+readinessProbe:
+  httpGet: { path: /readyz, port: http }
+  initialDelaySeconds: 2
+  periodSeconds: 5
+```
+
+`/healthz` はプロセスが HTTP 応答できるかだけを見ます。
+`/readyz` は storage に ping し、保存先が使えるかを見ます。
+この分離により、依存先の一時的な不調ではトラフィックを止め、プロセス自体の不調では再起動できます。
+
+### resources と QoS クラス
+
+Deployment には resources もあります。
+
+```yaml title="deploy/k8s/base/deployment.yaml"
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { memory: 128Mi }
+```
+
+`requests` はスケジューリング時の予約です。
+Kubernetes の scheduler は、ノードに requests の合計を載せられるか見て Pod を配置します。
+`limits` は実行時の上限です。
+このマニフェストではメモリだけ `128Mi` に制限しており、超えると OOMKilled される可能性があります。
+CPU limit は置いていません。
+CPU limit は throttling でレイテンシに影響することがあるため、教材では小さな request だけにしています。
+
+QoS クラスは resources の指定から決まります。
+CPU とメモリの request/limit がすべてあり、同じ値なら `Guaranteed`。
+一部でも request または limit があり、Guaranteed ではないなら `Burstable`。
+何もなければ `BestEffort` です。
+今日の shortlink Pod は CPU request、memory request、memory limit はありますが CPU limit がないため、`Burstable` です。
+
+### RollingUpdate と readiness の連携
+
+Day 10 の Deployment は RollingUpdate 戦略です。
+
+```yaml title="deploy/k8s/base/deployment.yaml"
+strategy:
+  type: RollingUpdate
+  rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+```
+
+`replicas: 2` で `maxSurge: 1` なので、更新中だけ最大 3 Pod まで増やせます。
+`maxUnavailable: 0` なので、ready な Pod 数を 2 未満に落とさないようにします。
+更新時は新しい Pod を 1 つ作り、その Pod が `/readyz` を通って Ready になってから古い Pod を 1 つ減らします。
+つまり、RollingUpdate の無停止更新は readiness とセットで考えます。
+
+このリポジトリの Day 10 検証では、`kubectl rollout restart deployment/shortlink -n shortlink` により Pod が 1 台ずつ入れ替わり、`deployment "shortlink" successfully rolled out` まで進むことを確認しています。
+また、`STORAGE=postgres` に切り替えた後も `/readyz` が `200` を返し、port-forward 経由で短縮リンク作成が動作することを確認しています。
+
+1 つ補足があります。このアプリは、起動時に Postgres へ到達できないとエラーで終了します。
+「DB の不調は `/readyz` が 503 で伝えるのでは?」と思うかもしれませんが、`/readyz` が守るのは起動に成功した後の話です。
+起動時に依存先がいない場合、Kubernetes はプロセスの異常終了を検知して再起動を繰り返します(CrashLoopBackOff)。
+Postgres が Ready になった次の再起動でアプリは正常に起動します。
+つまり「起動時の依存不足は再起動ループで吸収し、起動後の依存不調は readiness でトラフィックから外す」という 2 段構えです。これも自己修復の一形態です。
+
+### PostgreSQL manifest の構成
+
+`deploy/k8s/postgres/01-app-configmap.yaml` は、同じ名前の `shortlink-config` を上書きし、`STORAGE=postgres` に切り替えます。
+環境変数として注入した値は起動済み Pod には自動反映されないため、後で `kubectl rollout restart` でアプリ Pod を再作成します。
+
+PostgreSQL のパスワードは `09-postgres-secret.yaml` の `postgres-secret` から参照します。
+データ保存には `10-postgres-pvc.yaml` の `postgres-data` PVC を使います。
+PVC は、Pod が作り直されてもデータを残すための保存領域要求です。
+
+`11-postgres-deployment.yaml` は `replicas: 1`、`strategy: Recreate` です。
+単一の `ReadWriteOnce` PVC を使う PostgreSQL Pod を、更新中に二重起動したくないからです。
+`12-postgres-service.yaml` は `postgres:5432` という安定した宛先を作ります。
+`base/02-secret.yaml` の `DATABASE_URL` も、この Service 名を使っています。
+
+## 手を動かす
+
+ここからは実際に確認します。
+リポジトリルートから始めます。
+Day 9 の kind クラスタが残っている場合は、クラスタ作成は不要です。
+
+```sh
+kind create cluster --config deploy/kind-config.yaml --name shortlink
+docker build -f deploy/Dockerfile -t shortlink:dev app
+kind load docker-image shortlink:dev --name shortlink
+```
+
+まず `base/` を適用します。
+
+```sh
+kubectl apply -f deploy/k8s/base
+kubectl get deploy,pod,svc -n shortlink
+```
+
+期待出力の形です。
+
+```txt
+configmap/shortlink-config created
+secret/shortlink-secret created
+deployment.apps/shortlink created
+deployment.apps/shortlink   2/2
+pod/shortlink-xxxxx-aaaaa   1/1   Running
+pod/shortlink-xxxxx-bbbbb   1/1   Running
+```
+
+次に probe の状態を見ます。
+
+```sh
+kubectl describe pod -n shortlink -l app.kubernetes.io/name=shortlink
+kubectl describe service shortlink -n shortlink
+```
+
+期待する見どころです。
+
+```txt
+Liveness:   http-get http://:http/healthz
+Readiness:  http-get http://:http/readyz
+Ready:      True
+Endpoints:  10.244.x.x:8080,10.244.x.y:8080
+```
+
+port-forward を起動し、別ターミナルで `/healthz` と `/readyz` を確認します。
+
+```sh
+kubectl port-forward svc/shortlink 8080:80 -n shortlink
+curl -i http://localhost:8080/healthz
+curl -i http://localhost:8080/readyz
+```
+
+期待出力です。
+
+```http
+HTTP/1.1 200 OK
+
+ok
+```
+
+次に PostgreSQL manifest を適用します。
+
+```sh
+kubectl apply -f deploy/k8s/postgres
+kubectl get deploy,pod,svc,pvc -n shortlink
+```
+
+期待出力の形です。
+
+```txt
+configmap/shortlink-config configured
+deployment.apps/postgres          1/1
+pod/postgres-xxxxx-aaaaa          1/1   Running
+persistentvolumeclaim/postgres-data   Bound
+```
+
+ConfigMap の変更をアプリ Pod に反映するため、rollout restart します。
+
+```sh
+kubectl rollout restart deployment/shortlink -n shortlink
+kubectl rollout status deployment/shortlink -n shortlink
+curl -i http://localhost:8080/readyz
+```
+
+期待出力です。
+
+```txt
+deployment.apps/shortlink restarted
+deployment "shortlink" successfully rolled out
+HTTP/1.1 200 OK
+ok
+```
+
+短縮リンク作成も確認します。
+
+```sh
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/day10/kubernetes-readiness"}'
+```
+
+期待出力の形です。
+
+```http
+HTTP/1.1 201 Created
+Location: http://localhost:8080/1
+{"code":"1","short_url":"http://localhost:8080/1"}
+```
+
+code は環境や既存データにより変わります(Day 10 時点は連番、Day 11 以降の最新版ではランダムな 7 文字になります)。
+Day 10 の検証では、`STORAGE=postgres` への切り替え後に `/readyz` が `200` になり、port-forward 経由で作成 API が動作しました。
+
+ローリング更新は、別ターミナルで watch しながら観察します。
+
+```sh
+kubectl get pod -n shortlink -w
+kubectl rollout restart deployment/shortlink -n shortlink
+kubectl rollout status deployment/shortlink -n shortlink
+```
+
+期待する流れの形です。
+
+```txt
+shortlink-bbbbb-22222   0/1   ContainerCreating
+shortlink-bbbbb-22222   1/1   Running
+shortlink-aaaaa-11111   1/1   Terminating
+deployment "shortlink" successfully rolled out
+```
+
+新しい Pod が Ready になってから古い Pod が減ることを見ます。
+最後に履歴と undo を試します。
+
+```sh
+kubectl rollout history deployment/shortlink -n shortlink
+kubectl rollout undo deployment/shortlink -n shortlink
+kubectl rollout status deployment/shortlink -n shortlink
+```
+
+期待出力です。
+
+```txt
+deployment.apps/shortlink rolled back
+deployment "shortlink" successfully rolled out
+```
+
+memory に戻したい場合は、base の ConfigMap を再適用して再起動します。
+
+```sh
+kubectl apply -f deploy/k8s/base/01-configmap.yaml
+kubectl rollout restart deployment/shortlink -n shortlink
+kubectl rollout status deployment/shortlink -n shortlink
+```
+
+片付ける場合は次です。
+
+```sh
+kubectl delete -f deploy/k8s/postgres --ignore-not-found
+kubectl delete -f deploy/k8s/base
+kind delete cluster --name shortlink
+```
+
+## クイズ
+
+<Quiz question="liveness probe に DB 疎通確認を入れてしまった場合に起きやすい症状はどれですか？" choices={['DB 障害のたびにアプリ Pod が再起動され、再起動ループに入りやすくなる', 'Service が自動的に Secret を暗号化する', 'Pod は再起動されず、必ず Service からだけ外れる', 'RollingUpdate が StatefulSet に変換される']} answer={0} explanation="liveness は再起動判断です。DB 障害はアプリ再起動で直るとは限らないため、DB まで見ると不要な再起動を繰り返す危険があります。" />
+
+<Quiz question="readiness probe が失敗している Pod の基本的な扱いはどれですか？" choices={['Service の転送先から外れるが、それだけでコンテナが再起動されるわけではない', '必ずコンテナが kill される', 'Secret の値が削除される', 'Deployment の replicas が 0 に変更される']} answer={0} explanation="readiness はトラフィックを流してよいかの判定です。失敗した Pod は Service の転送先から外れますが、再起動判断は liveness の役割です。" />
+
+<Quiz question="resources の requests と limits の説明として正しいものはどれですか？" choices={['requests はスケジューリング時の予約、limits はコンテナが使える上限', 'requests はログ保存先、limits は Service のポート番号', 'requests は Secret の暗号化方式、limits は base64 の長さ', 'requests は Pod 名、limits は Namespace 名']} answer={0} explanation="scheduler は requests を見て配置先を決めます。limits は実行時の上限で、特にメモリ limit を超えると OOMKilled される可能性があります。" />
+
+<Quiz question="RollingUpdate の maxUnavailable: 0 が意味することはどれですか？" choices={['更新中に ready な Pod 数を desired replicas より減らさないようにする', '更新中に Pod を 0 個まで減らしてから新しい Pod を作る', '必ず 0 秒で更新を完了する', 'Secret を 0 個にする']} answer={0} explanation="maxUnavailable: 0 は、更新中に利用可能な Pod 数を落とさない指定です。maxSurge: 1 と合わせると、新しい Pod が Ready になってから古い Pod を減らせます。" />
+
+<Quiz question="Kubernetes Secret の値について正しい説明はどれですか？" choices={['base64 表現は暗号化ではないため、Secret だけで安全と考えてはいけない', 'Secret に入れた値は誰にも読めない完全な暗号文になる', 'Secret は ConfigMap と同じ名前でなければ参照できない', 'Secret は Pod から環境変数として参照できない']} answer={0} explanation="Kubernetes Secret は値を base64 で表現しますが、base64 は暗号化ではありません。本番では RBAC、etcd 暗号化、外部 Secret 管理なども考えます。" />
+
+## 今日のまとめ
+
+今日は、Kubernetes 上の shortlink を運用に近い形へ進めました。
+ConfigMap で通常の設定値を渡し、Secret で接続文字列やパスワードを分けました。
+ただし Secret の base64 は暗号化ではないため、本番では権限管理や暗号化も必要です。
+
+`/healthz` は liveness 用で、プロセスが HTTP 応答できるかだけを見ます。
+`/readyz` は readiness 用で、`Storage.Ping` により保存先へ疎通できるかを確認します。
+readiness が失敗した Pod は Service の転送先から外れますが、それだけで再起動されるわけではありません。
+
+resources では、requests がスケジューリング時の予約、limits が実行時の上限です。
+今日の shortlink Pod は CPU request、memory request、memory limit を持ち、CPU limit はないため `Burstable` です。
+RollingUpdate では、`maxSurge: 1` と `maxUnavailable: 0` により、Ready な Pod 数を落とさず入れ替えます。
+PostgreSQL 側は、単一 PVC を使う DB Pod の二重起動を避けるため `strategy: Recreate` にしています。
+
+## 明日の予告
+
+Day 11 では、水平スケールと HPA に進みます。
+Pod を増やして負荷を分散するには、アプリがステートレスであることが重要です。
+そのため、プロセス内の連番カウンタを見直し、ランダムな base62 コードと衝突リトライへ切り替えてから、自動スケールを観察します。

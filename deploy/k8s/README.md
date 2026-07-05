@@ -1,6 +1,6 @@
-# Day 9: Kubernetes with kind
+# Day 9-10: Kubernetes with kind
 
-この手順は `deploy` ディレクトリから実行します。Day 9 では Kubernetes の基本構造に集中するため、アプリは `STORAGE=memory` で起動します。
+この手順は `deploy` ディレクトリから実行します。base は Kubernetes の基本構造に集中するため、アプリは `STORAGE=memory` で起動します。Day 10 では ConfigMap/Secret、liveness/readiness probe、resources、ローリング更新、教材用 PostgreSQL manifest を追加します。
 
 ```sh
 cd deploy
@@ -38,6 +38,7 @@ kubectl apply -f k8s/base
 
 ```sh
 kubectl get all -n shortlink
+kubectl get configmap,secret -n shortlink
 ```
 
 ## 5. port-forward でローカルから接続する
@@ -50,9 +51,12 @@ kubectl port-forward svc/shortlink 8080:80 -n shortlink
 
 ```sh
 curl http://localhost:8080/healthz
+curl http://localhost:8080/readyz
 ```
 
 期待する応答は `ok` です。
+
+`/healthz` は liveness 用で、プロセスが HTTP 応答できるかだけを見ます。`/readyz` は readiness 用で、storage に ping して Service の転送先に入れてよいかを見ます。
 
 リンク作成も確認できます。
 
@@ -96,11 +100,77 @@ kubectl exec -n shortlink "$POD_NAME" -- /bin/sh
 
 `exec: "/bin/sh": stat /bin/sh: no such file or directory` のようなエラーが出れば、distroless には `sh` が無いことを確認できています。
 
+## PostgreSQL へ切り替える
+
+base は `STORAGE=memory` のままです。Kubernetes 内の教材用 PostgreSQL を使う場合は、base を適用した後に `k8s/postgres` を適用します。
+
+```sh
+kubectl apply -f k8s/postgres
+```
+
+`k8s/postgres/01-app-configmap.yaml` は `shortlink-config` を上書きし、`STORAGE=postgres` に切り替えます。base の `shortlink-secret` には教材用ダミーの `DATABASE_URL` が入っています。本物の接続文字列やパスワードはリポジトリに入れないでください。
+
+ConfigMap の変更は起動済み Pod の環境変数には自動反映されないため、アプリ Pod を再作成します。
+
+```sh
+kubectl rollout restart deployment/shortlink -n shortlink
+kubectl rollout status deployment/shortlink -n shortlink
+```
+
+PostgreSQL とアプリの状態を確認します。
+
+```sh
+kubectl get deploy,pod,svc,pvc -n shortlink
+kubectl describe pod -n shortlink -l app.kubernetes.io/name=shortlink
+kubectl logs -n shortlink -l app.kubernetes.io/name=postgres --tail=50
+```
+
+memory に戻す場合は base の ConfigMap を再適用し、同じく rollout restart します。
+
+```sh
+kubectl apply -f k8s/base/01-configmap.yaml
+kubectl rollout restart deployment/shortlink -n shortlink
+kubectl rollout status deployment/shortlink -n shortlink
+```
+
+## ローリング更新を観察する
+
+Deployment は `RollingUpdate`、`maxSurge: 1`、`maxUnavailable: 0` です。新しい Pod が `/readyz` を通るまで古い Pod を残すため、ready な Pod 数を減らさずに更新できます。
+
+まず状態を別ターミナルで見続けます。
+
+```sh
+kubectl get pod -n shortlink -w
+```
+
+別のターミナルでイメージタグを更新して rollout を発生させます。実際に試す場合は、先に新しいタグのイメージを build して kind に load してください。
+
+```sh
+docker build -f Dockerfile -t shortlink:day10 ../app
+kind load docker-image shortlink:day10 --name shortlink
+kubectl set image deployment/shortlink shortlink=shortlink:day10 -n shortlink
+kubectl rollout status deployment/shortlink -n shortlink
+```
+
+更新履歴を確認します。
+
+```sh
+kubectl rollout history deployment/shortlink -n shortlink
+```
+
+問題があった更新は undo で直前の ReplicaSet に戻せます。
+
+```sh
+kubectl rollout undo deployment/shortlink -n shortlink
+kubectl rollout status deployment/shortlink -n shortlink
+```
+
 ## 後片付け
 
 マニフェストだけ削除する場合:
 
 ```sh
+kubectl delete -f k8s/postgres --ignore-not-found
 kubectl delete -f k8s/base
 ```
 

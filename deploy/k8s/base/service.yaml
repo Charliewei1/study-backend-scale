@@ -34,5 +34,6 @@ spec:
     - name: http
       # port は Service がクラスタ内部に公開するポートです。
       port: 80
-      # targetPort は Pod 側の転送先ポートです。Deployment の containerPort 8080 に合わせます。
-      targetPort: 8080
+      # targetPort は Deployment の ports.name: http を参照します。
+      # 数値ではなく名前で結合すると、コンテナ側のポート番号を変えても Service 側の意図が保たれます。
+      targetPort: http

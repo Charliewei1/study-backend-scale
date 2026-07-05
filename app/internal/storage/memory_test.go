@@ -57,21 +57,21 @@ func TestMemoryStoreLoadMissing(t *testing.T) {
 	}
 }
 
-func TestMemoryStoreOverwrite(t *testing.T) {
+func TestMemoryStoreSaveConflict(t *testing.T) {
 	store := NewMemoryStore()
 	if err := store.Save(context.Background(), "1", "https://old.example.com"); err != nil {
 		t.Fatalf("Save old URL returned error: %v", err)
 	}
-	if err := store.Save(context.Background(), "1", "https://new.example.com"); err != nil {
-		t.Fatalf("Save new URL returned error: %v", err)
+	if err := store.Save(context.Background(), "1", "https://new.example.com"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Save duplicate URL returned %v, want ErrConflict", err)
 	}
 
 	got, err := store.Load(context.Background(), "1")
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got != "https://new.example.com" {
-		t.Fatalf("Load returned %q, want overwritten URL", got)
+	if got != "https://old.example.com" {
+		t.Fatalf("Load returned %q, want original URL", got)
 	}
 }
 

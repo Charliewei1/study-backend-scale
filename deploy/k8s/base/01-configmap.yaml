@@ -1,0 +1,19 @@
+# ConfigMap は機密ではない設定値を Pod に渡すためのリソースです。
+# base は Day 9 と同じく外部 DB を使わない memory 保存をデフォルトにします。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shortlink-config
+  namespace: shortlink
+  labels:
+    app.kubernetes.io/name: shortlink
+    app.kubernetes.io/instance: shortlink
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: study-backend-scale
+data:
+  # アプリが listen するポートです。Deployment の containerPort/probe と合わせます。
+  PORT: "8080"
+  # base では Pod 構造や probe の学習に集中するため、プロセス内 memory を使います。
+  STORAGE: memory
+  # sqlite に切り替える日以降のための例です。memory/postgres では使われません。
+  SQLITE_PATH: /data/shortlink.db

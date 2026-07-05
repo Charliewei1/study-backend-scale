@@ -82,15 +82,31 @@ func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
+// Ping は SQLite 接続が利用可能かを確認します。
+func (s *SQLiteStore) Ping(ctx context.Context) error {
+	if err := s.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("ping sqlite: %w", err)
+	}
+	return nil
+}
+
 // Save は code と url の対応を SQLite に保存します。
 func (s *SQLiteStore) Save(ctx context.Context, code, url string) error {
 	const query = `
 INSERT INTO links (code, url)
 VALUES (?, ?)
-ON CONFLICT(code) DO UPDATE SET url = excluded.url;`
+ON CONFLICT(code) DO NOTHING;`
 
-	if _, err := s.db.ExecContext(ctx, query, code, url); err != nil {
+	result, err := s.db.ExecContext(ctx, query, code, url)
+	if err != nil {
 		return fmt.Errorf("save link: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read save result: %w", err)
+	}
+	if affected == 0 {
+		return ErrConflict
 	}
 	return nil
 }

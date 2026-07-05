@@ -77,6 +77,11 @@ func (s *RedisStore) Save(ctx context.Context, code, url string) error {
 	return s.next.Save(ctx, code, url)
 }
 
+// Ping delegates readiness checks to the authoritative storage.
+func (s *RedisStore) Ping(ctx context.Context) error {
+	return s.next.Ping(ctx)
+}
+
 // Load returns code's URL from Redis when possible, falling back to storage on
 // misses or Redis failures. Redis errors are logged but never returned.
 func (s *RedisStore) Load(ctx context.Context, code string) (string, error) {

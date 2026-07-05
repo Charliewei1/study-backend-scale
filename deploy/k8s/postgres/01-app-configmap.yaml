@@ -1,0 +1,16 @@
+# この ConfigMap は base の shortlink-config を上書きし、
+# アプリを PostgreSQL 保存に切り替えます。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shortlink-config
+  namespace: shortlink
+  labels:
+    app.kubernetes.io/name: shortlink
+    app.kubernetes.io/instance: shortlink
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: study-backend-scale
+data:
+  PORT: "8080"
+  STORAGE: postgres
+  SQLITE_PATH: /data/shortlink.db

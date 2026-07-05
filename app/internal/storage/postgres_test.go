@@ -43,7 +43,7 @@ func TestPostgresStoreLoadMissing(t *testing.T) {
 	}
 }
 
-func TestPostgresStoreOverwrite(t *testing.T) {
+func TestPostgresStoreSaveConflict(t *testing.T) {
 	store, prefix := newTestPostgresStore(t)
 	ctx := context.Background()
 	code := prefix + "_abc"
@@ -51,16 +51,16 @@ func TestPostgresStoreOverwrite(t *testing.T) {
 	if err := store.Save(ctx, code, "https://old.example.com"); err != nil {
 		t.Fatalf("Save old URL returned error: %v", err)
 	}
-	if err := store.Save(ctx, code, "https://new.example.com"); err != nil {
-		t.Fatalf("Save new URL returned error: %v", err)
+	if err := store.Save(ctx, code, "https://new.example.com"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Save duplicate URL returned %v, want ErrConflict", err)
 	}
 
 	got, err := store.Load(ctx, code)
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got != "https://new.example.com" {
-		t.Fatalf("Load returned %q, want overwritten URL", got)
+	if got != "https://old.example.com" {
+		t.Fatalf("Load returned %q, want original URL", got)
 	}
 }
 

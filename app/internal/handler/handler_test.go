@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -127,6 +128,40 @@ func TestCreateLink(t *testing.T) {
 			}
 			assertJSONBody(t, rec.Body.String(), tt.wantBody)
 		})
+	}
+}
+
+func TestCreateLinkRetriesAfterCodeConflict(t *testing.T) {
+	store := &conflictOnceStore{
+		MemoryStore:        storage.NewMemoryStore(),
+		conflictsRemaining: 1,
+	}
+	h := New(shortener.New(), store, testBaseURL, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/links", strings.NewReader(`{"url":"https://example.com/articles/1"}`))
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != testBaseURL+"/2" {
+		t.Fatalf("Location = %q, want %q", got, testBaseURL+"/2")
+	}
+	assertJSONBody(t, rec.Body.String(), map[string]string{
+		"code":      "2",
+		"short_url": testBaseURL + "/2",
+	})
+	if got, want := strings.Join(store.savedCodes, ","), "1,2"; got != want {
+		t.Fatalf("saved codes = %q, want %q", got, want)
+	}
+
+	gotURL, err := store.Load(context.Background(), "2")
+	if err != nil {
+		t.Fatalf("Load retried code returned error: %v", err)
+	}
+	if gotURL != "https://example.com/articles/1" {
+		t.Fatalf("Load retried code = %q, want original URL", gotURL)
 	}
 }
 
@@ -304,6 +339,45 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+func TestReadyz(t *testing.T) {
+	tests := []struct {
+		name       string
+		store      storage.Storage
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "storage available",
+			store:      storage.NewMemoryStore(),
+			wantStatus: http.StatusOK,
+			wantBody:   "ok",
+		},
+		{
+			name:       "storage unavailable",
+			store:      failingPingStore{MemoryStore: storage.NewMemoryStore()},
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "storage unavailable\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New(shortener.New(), tt.store, testBaseURL, nil)
+			req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+			rec := httptest.NewRecorder()
+
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if got := rec.Body.String(); got != tt.wantBody {
+				t.Fatalf("body = %q, want %q", got, tt.wantBody)
+			}
+		})
+	}
+}
+
 func TestCacheStats(t *testing.T) {
 	store := storage.NewMemoryStore()
 	h := New(shortener.New(), store, testBaseURL, nil, fakeCacheStats{
@@ -339,6 +413,29 @@ type fakeCacheStats struct {
 
 func (s fakeCacheStats) Stats() cache.Stats {
 	return s.stats
+}
+
+type failingPingStore struct {
+	*storage.MemoryStore
+}
+
+func (s failingPingStore) Ping(ctx context.Context) error {
+	return errors.New("storage down")
+}
+
+type conflictOnceStore struct {
+	*storage.MemoryStore
+	conflictsRemaining int
+	savedCodes         []string
+}
+
+func (s *conflictOnceStore) Save(ctx context.Context, code, url string) error {
+	s.savedCodes = append(s.savedCodes, code)
+	if s.conflictsRemaining > 0 {
+		s.conflictsRemaining--
+		return storage.ErrConflict
+	}
+	return s.MemoryStore.Save(ctx, code, url)
 }
 
 func assertJSONBody(t *testing.T, body string, want map[string]string) {

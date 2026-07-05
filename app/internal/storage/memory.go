@@ -21,6 +21,12 @@ func NewMemoryStore() *MemoryStore {
 	}
 }
 
+// Ping は readiness check 用の軽い疎通確認です。
+// MemoryStore は外部依存を持たないため、プロセスが動いていれば常に ok とします。
+func (s *MemoryStore) Ping(ctx context.Context) error {
+	return nil
+}
+
 // Save は code と url の対応を保存します。
 func (s *MemoryStore) Save(ctx context.Context, code, url string) error {
 	if err := ctx.Err(); err != nil {
@@ -30,10 +36,14 @@ func (s *MemoryStore) Save(ctx context.Context, code, url string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	link := s.links[code]
-	link.Code = code
-	link.URL = url
-	s.links[code] = link
+	if _, ok := s.links[code]; ok {
+		return ErrConflict
+	}
+
+	s.links[code] = Link{
+		Code: code,
+		URL:  url,
+	}
 	return nil
 }
 

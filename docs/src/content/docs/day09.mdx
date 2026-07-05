@@ -8,6 +8,10 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+:::note[このページのコードについて]
+このページは Day 9 時点のコードを解説しています。当時のコードは `git checkout day09` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+:::
+
 ## 今日のゴール
 
 - Kubernetes が Docker Compose と比べて何を解決するのか説明できるようになる。
@@ -67,6 +71,9 @@ deploy/k8s/base/
   deployment.yaml
   service.yaml
 ```
+
+最新のリポジトリでは、Day 10 で扱う ConfigMap、Secret、probe のマニフェストも `base/` に追加されます。
+Day 9 時点の構成だけを見たい場合は `git checkout day09` で確認してください。
 
 `00-namespace.yaml` は Namespace を作ります。
 Namespace は、クラスタ内のリソースを論理的に分ける単位です。
@@ -319,9 +326,30 @@ Location: https://example.com/day09/kubernetes
 ```
 
 今日は Pod が 2 つあり、Service がどちらかへ転送します。
-ただし `STORAGE=memory` なので、それぞれの Pod は別々のメモリを持っています。
-短縮リンクを作った Pod と、リダイレクトを受けた Pod が違う場合、`404` になることがあります。
-その場合は数回試すか、今日の主題として「メモリ保存は複数 Pod と相性が悪い」ことを観察してください。
+ただし `kubectl port-forward svc/shortlink ...` は実際には選ばれた 1 Pod への接続を張るため、ローカルからの `curl` だけでは「POST と GET が別 Pod に行って 404 になる」様子は観察しにくいです。
+port-forward では、同じ接続先 Pod のメモリにあるデータを読めている、と理解してください。
+
+複数 Pod でメモリ保存が問題になる様子を観察したい場合は、クラスタ内に一時 Pod を立て、Service 名へ何度もアクセスします。
+
+```sh
+kubectl run curl -n shortlink --rm -it --image=curlimages/curl --command -- sh
+```
+
+一時 Pod の中で短縮リンクを作り、Service 名へ複数回アクセスします。
+
+```sh
+CODE=$(curl -s -X POST http://shortlink/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/day09/kubernetes"}' \
+  | sed -n 's/.*"code":"\([^"]*\)".*/\1/p')
+
+for i in 1 2 3 4 5; do
+  curl -i "http://shortlink/${CODE}"
+done
+```
+
+Service がリクエストごとに別 Pod へ振り分けると、短縮リンクを作った Pod では `302`、別 Pod では `404` になる可能性があります。
+この挙動が、メモリ保存は複数 Pod と相性が悪い、という今日の観察ポイントです。
 この問題は Day 11 のステートレス設計でもう一度扱います。
 
 ### 自己修復を観察する

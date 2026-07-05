@@ -99,6 +99,10 @@ func (s *blockingStore) Save(context.Context, string, string) error {
 	return nil
 }
 
+func (s *blockingStore) Ping(context.Context) error {
+	return nil
+}
+
 func (s *blockingStore) Load(context.Context, string) (string, error) {
 	return "", storage.ErrNotFound
 }

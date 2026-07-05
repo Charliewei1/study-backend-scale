@@ -1,0 +1,6 @@
+# Day 7 のキャッシュなしベースライン再現用 override です。
+# 使い方: docker compose -f compose.yaml -f compose.nocache.yaml up -d --build
+services:
+  app:
+    environment:
+      REDIS_ADDR: ""

@@ -8,6 +8,10 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+:::note[このページのコードについて]
+このページは Day 3 時点のコードを解説しています。当時のコードは `git checkout day03` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+:::
+
 ## 今日のゴール
 
 - 保存先を `Storage` インターフェースとして切り出す理由を説明できるようになる。
@@ -154,22 +158,25 @@ type SQLiteStore struct {
 HTTP サーバでは、複数のリクエストが同時に来ます。
 そのたびに接続を作って捨てると、遅くなり、リソースも無駄になります。
 `database/sql` は、接続の再利用や待ち合わせを管理する共通の仕組みを提供します。
+ただし、SQLite は 1 ファイルを直接扱うデータベースなので、同時書き込みには制約があります。
+`*sql.DB` のプールがあっても、SQLite を使う限りスケールの主役にはならず、Day 6 で Postgres へ進む理由もここにあります。
 
 SQLite の初期化では、`sql.Open("sqlite", path)` で `*sql.DB` を作り、続けて `CREATE TABLE IF NOT EXISTS links (...)` を `ExecContext` で実行します。
 `links` テーブルでは、`code` が主キーです。
-同じコードを 2 回保存した場合は、`Save` の `ON CONFLICT` によって URL が更新されます。
+同じコードを 2 回保存しようとした場合は、主キー制約で保存に失敗します。
 
 ```go title="app/internal/storage/sqlite.go"
 const query = `
 INSERT INTO links (code, url)
-VALUES (?, ?)
-ON CONFLICT(code) DO UPDATE SET url = excluded.url;`
+VALUES (?, ?);`
 ```
 
 Day 3 時点では、短縮コード生成器のカウンタはまだメモリ上にあります。
 そのため、サーバ再起動後に新しいリンクを作ると、また `"1"` から採番されます。
-今回の手順では「作ったリンクが再起動後も読めること」を確認します。
+そこで保存は insert-only にし、衝突したら次のコードでリトライすることで、既存リンクを上書きする事故を防いでいます。
+ただし、これは根本解決ではありません。
 複数台構成でも安全な ID 採番は、Day 11 でランダム base62 へ進むときに扱います。
+今回の手順では「作ったリンクが再起動後も読めること」を確認します。
 
 ### modernc.org/sqlite を選んだ理由
 

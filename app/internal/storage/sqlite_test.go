@@ -40,23 +40,23 @@ func TestSQLiteStoreLoadMissing(t *testing.T) {
 	}
 }
 
-func TestSQLiteStoreOverwrite(t *testing.T) {
+func TestSQLiteStoreSaveConflict(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	ctx := context.Background()
 
 	if err := store.Save(ctx, "abc", "https://old.example.com"); err != nil {
 		t.Fatalf("Save old URL returned error: %v", err)
 	}
-	if err := store.Save(ctx, "abc", "https://new.example.com"); err != nil {
-		t.Fatalf("Save new URL returned error: %v", err)
+	if err := store.Save(ctx, "abc", "https://new.example.com"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Save duplicate URL returned %v, want ErrConflict", err)
 	}
 
 	got, err := store.Load(ctx, "abc")
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
 	}
-	if got != "https://new.example.com" {
-		t.Fatalf("Load returned %q, want overwritten URL", got)
+	if got != "https://old.example.com" {
+		t.Fatalf("Load returned %q, want original URL", got)
 	}
 }
 

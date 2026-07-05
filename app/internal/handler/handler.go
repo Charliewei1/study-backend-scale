@@ -13,6 +13,8 @@ import (
 	"github.com/study-backend-scale/shortlink/internal/storage"
 )
 
+const createLinkMaxAttempts = 64
+
 // Handler は URL 短縮 API の依存関係をまとめた型です。
 type Handler struct {
 	shortener *shortener.Shortener
@@ -41,6 +43,7 @@ func New(shortener *shortener.Shortener, store storage.Storage, baseURL string, 
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
+	mux.HandleFunc("GET /readyz", h.readyz)
 	mux.HandleFunc("GET /api/cache/stats", h.getCacheStats)
 	mux.HandleFunc("POST /api/links", h.createLink)
 	mux.HandleFunc("GET /api/links/{code}/stats", h.getLinkStats)
@@ -75,6 +78,20 @@ type errorResponse struct {
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
+	// /healthz は liveness 用です。プロセスが応答できるかだけを見て、
+	// DB などの外部依存には触りません。依存先障害で再起動ループに入るのを避けます。
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (h *Handler) readyz(w http.ResponseWriter, r *http.Request) {
+	// /readyz は readiness 用です。リクエストを受けてよい状態かを判定するため、
+	// storage に軽く ping します。失敗時は Service の転送先から外して再起動はしません。
+	if err := h.store.Ping(r.Context()); err != nil {
+		http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("ok"))
 }
@@ -99,20 +116,33 @@ func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code := h.shortener.Next()
-	if err := h.store.Save(r.Context(), code, req.URL); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "internal server error")
-		return
-	}
-	shortURL := h.shortURL(code)
+	var code string
+	for attempt := 0; attempt < createLinkMaxAttempts; attempt++ {
+		code = h.shortener.Next()
+		err := h.store.Save(r.Context(), code, req.URL)
+		if err == nil {
+			shortURL := h.shortURL(code)
 
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Location", shortURL)
-	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(createLinkResponse{
-		Code:     code,
-		ShortURL: shortURL,
-	})
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Location", shortURL)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createLinkResponse{
+				Code:     code,
+				ShortURL: shortURL,
+			})
+			return
+		}
+		if !errors.Is(err, storage.ErrConflict) {
+			writeJSONError(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+
+		// 連番カウンタはプロセス内だけで持つため、再起動すると 1 に戻り、
+		// 永続化済みの短縮コードと衝突することがあります。ここでは教材上の暫定策として
+		// 次の連番で再試行し、Day 11 のランダム採番で根本的に衝突しにくい設計にします。
+	}
+
+	writeJSONError(w, http.StatusInternalServerError, "internal server error")
 }
 
 func (h *Handler) getLink(w http.ResponseWriter, r *http.Request) {

@@ -22,6 +22,15 @@ metadata:
 spec:
   # replicas は起動しておきたい Pod の数です。
   replicas: 2
+  # strategy は Deployment 更新時の Pod 入れ替え方法です。
+  strategy:
+    # RollingUpdate は古い Pod を残しながら新しい Pod を少しずつ作ります。
+    type: RollingUpdate
+    rollingUpdate:
+      # maxSurge: 1 により、更新中だけ desired replicas より 1 つ多く起動できます。
+      maxSurge: 1
+      # maxUnavailable: 0 により、ready な Pod 数を減らさずに入れ替えます。
+      maxUnavailable: 0
   # selector は Deployment と Pod template を結び付ける条件です。
   selector:
     # matchLabels は指定したラベルをすべて持つ Pod を対象にします。
@@ -54,14 +63,63 @@ spec:
           image: shortlink:dev
           # imagePullPolicy: Never は外部レジストリへ取りに行かず、kind 内のローカルイメージだけを使います。
           imagePullPolicy: Never
-          # env はコンテナに渡す環境変数です。
+          # env はコンテナに渡す環境変数です。通常の設定は ConfigMap、
+          # 接続文字列のような機密値は Secret から参照します。
           env:
-            # STORAGE=memory により、Day 9 では外部 DB なしで Pod 構造の学習に集中します。
+            # PORT はアプリの待ち受けポートです。
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: shortlink-config
+                  key: PORT
+            # STORAGE は保存先を切り替える設定です。base の ConfigMap では memory です。
             - name: STORAGE
-              value: memory
+              valueFrom:
+                configMapKeyRef:
+                  name: shortlink-config
+                  key: STORAGE
+            # SQLITE_PATH は sqlite 選択時だけ使います。
+            - name: SQLITE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: shortlink-config
+                  key: SQLITE_PATH
+            # DATABASE_URL は postgres 選択時だけ使います。
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: shortlink-secret
+                  key: DATABASE_URL
           # ports はコンテナが待ち受けるポートを Kubernetes に知らせます。
           ports:
             # name は Service などから参照しやすいポート名です。
             - name: http
               # containerPort はアプリがコンテナ内で listen するポートです。
               containerPort: 8080
+          # livenessProbe は「プロセスを再起動すべきか」を見る probe です。
+          # /healthz は外部依存を見ないため、DB 障害で再起動ループに入りません。
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # readinessProbe は「Service の転送先に入れてよいか」を見る probe です。
+          # /readyz は storage へ ping し、DB 準備中は 503 を返してトラフィックを止めます。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # resources はスケジューリング時の予約(requests)と上限(limits)です。
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi

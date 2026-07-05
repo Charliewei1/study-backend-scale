@@ -128,6 +128,27 @@ func TestRedisStoreDelegatesNonLoadOperations(t *testing.T) {
 	}
 }
 
+func TestRedisStoreSavePropagatesConflict(t *testing.T) {
+	ctx := context.Background()
+	store := newCountingStore(t)
+	cached := newRedisStore(store, newFakeRedisClient(), time.Hour)
+
+	if err := cached.Save(ctx, "abc", "https://old.example.com"); err != nil {
+		t.Fatalf("initial Save returned error: %v", err)
+	}
+	if err := cached.Save(ctx, "abc", "https://new.example.com"); !errors.Is(err, storage.ErrConflict) {
+		t.Fatalf("duplicate Save returned %v, want ErrConflict", err)
+	}
+
+	got, err := store.Load(ctx, "abc")
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got != "https://old.example.com" {
+		t.Fatalf("Load = %q, want original URL", got)
+	}
+}
+
 type countingStore struct {
 	*storage.MemoryStore
 	loads int

@@ -1,0 +1,19 @@
+# PVC は PostgreSQL のデータを Pod の再作成後も残すための保存領域要求です。
+# kind では通常、標準の StorageClass が動的に PersistentVolume を用意します。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: shortlink
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/instance: shortlink
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: study-backend-scale
+spec:
+  # 単一ノード kind と単一 Postgres Pod を想定した最小構成です。
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

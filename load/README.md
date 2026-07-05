@@ -26,9 +26,18 @@ k6 run load/day07-baseline.js
 BASE_URL=http://localhost:8080 k6 run load/day07-baseline.js
 ```
 
+Day 8 のキャッシュあり測定では、測定後に `/api/cache/stats` を curl で確認します。
+
+```sh
+BASE_URL=http://localhost:8080 k6 run load/day08-cached.js
+curl http://localhost:8080/api/cache/stats
+```
+
 ## 結果の読み方
 
 `http_req_duration` の `p(95)` は、全リクエストの 95% がその時間以内に終わったことを示します。平均よりも、遅いリクエストの影響を見つけやすい値です。
+
+`http_req_duration{name:redirect}` の `p(95)` は、短縮 URL のリダイレクト GET だけを切り出した応答時間です。Day 8 ではここを Day 7 と比較すると、Redis キャッシュの効果を見やすくなります。
 
 `iterations` は k6 の default 関数が何回実行されたかです。この教材の Day 7 スクリプトでは、1 iteration ごとに GET か POST を 1 回実行します。
 
