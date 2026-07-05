@@ -1,0 +1,456 @@
+---
+title: "Day 11 - 水平スケールと HPA"
+description: ステートレスな URL 短縮サービスへ変更し、ランダム base62 採番、衝突リトライ、HorizontalPodAutoscaler、metrics-server、k6 によるスケール観察を学びます。
+sidebar:
+  label: Day 11
+  order: 11
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+:::note[このページのコードについて]
+このページは Day 11 時点のコードを解説しています。当時のコードは `git checkout day11` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+:::
+
+## 今日のゴール
+
+- 垂直スケールと水平スケールの違いを説明できるようになる。
+- 複数レプリカでプロセス内の連番カウンタがなぜ破綻するかを説明できるようになる。
+- ステートレスなアプリケーションが、水平スケールと相性がよい理由を理解する。
+- 分散 ID 採番の選択肢として、ランダム + UNIQUE 制約 + リトライ、採番サービス、Snowflake を比較できるようになる。
+- 7 文字 base62 の探索空間と、衝突リトライの直感を説明できるようになる。
+- HPA が `desiredReplicas = ceil(currentReplicas × currentMetric / targetMetric)` で Pod 数を調整することを理解する。
+- metrics-server が HPA と `kubectl top` に CPU/メモリ指標を渡す役割を持つことを説明できるようになる。
+- k6 で負荷をかけ、`kubectl get hpa -w` でレプリカ数が増える様子を観察できるようになる。
+
+## 解説
+
+Day 10 では、Kubernetes 上の Deployment に ConfigMap、Secret、probe、resources、RollingUpdate を追加しました。
+今日は、その Deployment を負荷に応じて増減できるようにします。
+中心になるリソースは HorizontalPodAutoscaler、略して HPA です。
+
+ただし、Pod を増やす前に大事な確認があります。
+アプリケーションが「増やしてよい形」になっているかです。
+Pod を 2 個から 5 個へ増やしても、各 Pod が自分だけの状態を前提に動いていると、正しさが壊れます。
+スケールは速さだけの話ではありません。
+同じリクエストをどの Pod が受けても同じように処理できる、という設計が先に必要です。
+
+今日の shortlink では、短縮コードの採番を見直します。
+Day 10 までは説明しやすい連番でした。
+Day 11 では、7 文字のランダム base62 コードを生成し、保存時に衝突したら小さくリトライします。
+これにより、アプリ Pod は「次の番号」をプロセス内に持たなくなり、水平スケールしやすくなります。
+
+### 垂直スケールと水平スケール
+
+スケールには、大きく 2 つの方向があります。
+垂直スケールは 1 台を強くする方法です。
+CPU やメモリを増やすだけなので単純ですが、マシンサイズには上限があり、障害時の影響も 1 台に集中します。
+
+水平スケールは、同じ役割の実行単位を横に増やす方法です。
+Kubernetes では Deployment の `replicas` を増やすと Pod が増え、Service がそれらへトラフィックを分散します。
+ただし、どの Pod がリクエストを受けても同じ結果になる設計が必要です。
+重要な状態は Pod のメモリではなく、Postgres や Redis のような共有ストアへ置く。
+この性質をステートレスと呼びます。
+
+### なぜ連番カウンタは複数レプリカで破綻するのか
+
+連番は、1 プロセスだけなら簡単です。
+`nextID` を 1 から始め、リクエストが来るたびに 1 ずつ増やせばよいからです。
+しかし、Pod が複数になると話が変わります。
+
+各 Pod は別プロセスです。
+メモリも別です。
+Pod A の `nextID` と Pod B の `nextID` は共有されません。
+すると、どちらも自分の世界で `1, 2, 3...` を発行します。
+
+```txt title="複数 Pod とプロセス内連番カウンタの衝突"
+Service shortlink
+  |
+  +--> Pod A: nextID = 1
+  |      POST /api/links -> code "1"
+  |
+  +--> Pod B: nextID = 1
+         POST /api/links -> code "1"
+
+Postgres links
+  code "1" already exists
+```
+
+これは「たまたま同時に来たから」だけの問題ではありません。
+Pod が再起動すると、プロセス内カウンタは初期値へ戻ります。
+新しい Pod が追加されたときも、その Pod は過去に発行された番号を知りません。
+ReplicaSet が自己修復で Pod を作り直すたびに、ローカルカウンタは過去の履歴から切り離されます。
+
+連番を使い続けたいなら、番号を発行する場所を全 Pod で共有する必要があります。
+たとえば、DB の sequence を使う、採番サービスを別に置く、分散 ID 生成アルゴリズムを導入する、といった設計です。
+「各 Pod が勝手に次の番号を持つ」は、水平スケールの前提と合いません。
+
+### Day 11 の Shortener
+
+Day 11 の `app/internal/shortener/shortener.go` は、プロセス内の連番を持ちません。
+`crypto/rand` で 7 文字の base62 コードを作ります。
+
+```go title="app/internal/shortener/shortener.go"
+const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+const codeLength = 7
+
+type Shortener struct{}
+
+func (s *Shortener) Next() (string, error) {
+	code := make([]byte, codeLength)
+	for i := range code {
+		n, err := rand.Int(rand.Reader, alphabetSize)
+		if err != nil {
+			return "", fmt.Errorf("generate random code: %w", err)
+		}
+		code[i] = alphabet[n.Int64()]
+	}
+	return string(code), nil
+}
+```
+
+`Shortener` は、次に発行する番号を持っていません。
+Pod A でも Pod B でも、同じロジックでランダムにコードを作ります。
+重要なのは、ランダム生成だけで完全性を保証しているわけではないことです。
+ランダムには、低い確率でも衝突があります。
+そのため、保存先側で「すでに同じ code があるか」を見ます。
+
+PostgreSQL では `code` が主キーです。
+`app/internal/storage/postgres.go` は `ON CONFLICT (code) DO NOTHING` を使い、重複して `RowsAffected() == 0` なら `storage.ErrConflict` を返します。
+
+### 衝突したら小さくリトライする
+
+ハンドラ側では、短縮コード生成と保存を最大 5 回まで試します。
+`ErrConflict` だけをリトライ対象にし、それ以外の DB エラーはすぐ 500 にします。
+
+```go title="app/internal/handler/handler.go"
+func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
+	var req createLinkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := validateURL(req.URL); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var code string
+	for attempt := 0; attempt < createLinkMaxAttempts; attempt++ {
+		var err error
+		code, err = h.shortener.Next()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+
+		err = h.store.Save(r.Context(), code, req.URL)
+		if err == nil {
+			shortURL := h.shortURL(code)
+
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Location", shortURL)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createLinkResponse{
+				Code:     code,
+				ShortURL: shortURL,
+			})
+			return
+		}
+		if !errors.Is(err, storage.ErrConflict) {
+			writeJSONError(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+
+		// 7 文字 base62 の空間は 62^7、約 3.5 兆通りあります。
+		// 衝突確率は極小ですが 0 ではないため、保存時の ErrConflict だけを小さく再試行します。
+	}
+
+	writeJSONError(w, http.StatusInternalServerError, "internal server error")
+}
+```
+
+この形は、水平スケールと相性がよいです。
+Pod はローカルに採番状態を持ちません。
+最終的な一意性は、共有された保存先で確認します。
+もし 2 つの Pod が同じコードを生成しても、片方だけが保存に成功し、もう片方は別のコードを生成し直します。
+
+ここで大事なのは、「衝突を絶対に起こさない」ではなく「衝突しても正しく処理できる」です。
+分散システムでは、珍しい事象を 0 とみなすより、起きたときの逃げ道を小さく用意するほうが堅い設計になります。
+
+### 分散 ID 採番の選択肢
+
+分散環境で一意な ID を作る方法はいくつかあります。
+今回選んだのは、ランダム + UNIQUE 制約 + リトライです。
+各 Pod がランダムコードを作り、DB の主キー制約で一意性を確認します。
+実装が小さく、特別な中央サービスが不要で、URL 短縮コードのように順序性が必須ではない値に向いています。
+
+別案として、採番サービスを置く方法があります。
+全 Pod が 1 つのサービスへ「次の ID」を問い合わせるため、一意性は管理しやすくなります。
+一方で、そのサービス自体の可用性、性能、運用が新しい課題になります。
+
+Snowflake のような分散 ID もあります。
+時刻、ノード ID、シーケンス番号を組み合わせる方式で、高スループットかつ時刻順に近い ID が欲しい場合に有力です。
+ただし、ノード ID の割り当てや時計のずれを考える必要があります。
+shortlink では短く見えるコードと教材としての分かりやすさを優先し、ランダム 7 文字 base62 と保存時リトライを選んでいます。
+
+### 誕生日問題の直感
+
+base62 は、1 文字に 62 種類を使う表現です。
+7 文字なら、候補数は `62^7` です。
+
+```txt title="7 文字 base62 の空間"
+62^7 = 3,521,614,606,208
+     ≒ 3.5 兆通り
+```
+
+3.5 兆通りある空間に、たとえば 100 万件のリンクが保存されているとします。
+次に 1 回ランダム生成したコードが既存のどれかに当たる確率は、ざっくり `1,000,000 / 3,500,000,000,000` です。
+これは約 0.000028% です。
+これは「既存 100 万件に対して、新規 1 件がぶつかる確率」です。
+1 回の作成で見れば、衝突はかなり小さい確率です。
+
+一方で、誕生日問題が教えてくれるのは、「組み合わせの数は思ったより速く増える」ということです。
+100 万件の中に 1 組でも同じ値が出るか、という見方をすると、単純な 1 回分より大きく見積もる必要があります。
+候補数を `N = 62^7`、作成数を `n = 1,000,000` とすると、少なくとも 1 組衝突する確率は近似的に `1 - exp(-n(n-1)/(2N))` で、約 13.2% です。
+これは「100 万件全体を作るまでにどこかで 1 回は衝突するか」という累積の見方です。
+だからこそ、ランダム生成だけを信じ切らず、保存先の UNIQUE 制約とリトライをセットにします。
+
+今日の設計では、衝突が起きても正常系の中で吸収します。
+既存コードとぶつかった 1 回だけを捨て、別のランダムコードを作り直します。
+累積で見れば衝突が起こりうる規模でも、リトライがあるため実害にはなりにくいです。
+5 回連続で既存コードに当たる確率はさらに小さく、教材の規模では現実的な失敗要因になりにくいです。
+
+### HPA は何をするのか
+
+アプリが水平スケールしやすい形になったので、次は Kubernetes 側です。
+HPA は、負荷指標を見て Deployment の `replicas` を自動で変更するコントローラです。
+今回のマニフェストは `deploy/k8s/base/03-hpa.yaml` です。
+
+```yaml title="deploy/k8s/base/03-hpa.yaml"
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: shortlink
+  namespace: shortlink
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: shortlink }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+`scaleTargetRef` は、どの Deployment を増減するかです。
+`minReplicas: 2` なので、負荷が低くても 2 Pod は残します。
+`maxReplicas: 10` なので、負荷が高くても 10 Pod までに抑えます。
+`averageUtilization: 70` は、Pod の CPU request に対する平均使用率を 70% くらいに保ちたい、という意味です。
+
+Deployment 側には `deploy/k8s/base/deployment.yaml` で `requests.cpu: 50m` が書かれています。
+HPA の CPU utilization は CPU request を基準にするため、Pod が平均で `35m` 使うと `35m / 50m = 70%` です。
+CPU request を書いていないと、CPU 使用率ベースの HPA は判断材料を持てません。
+
+### HPA の計算式
+
+HPA の基本的な考え方は比例制御です。
+現在のレプリカ数に、現在の指標が目標の何倍かを掛けます。
+
+```txt title="HPA の基本式"
+desiredReplicas = ceil(currentReplicas × currentMetric / targetMetric)
+```
+
+たとえば現在 2 Pod、CPU 使用率 140%、目標 70% なら `ceil(2 × 140 / 70) = 4` です。
+この場合、HPA は Deployment の desired replicas を 4 に近づけます。
+逆に、現在 4 Pod で CPU 使用率が 35%、目標が 70% なら、式だけ見れば 2 Pod です。
+ただし、実際の HPA は短時間で上下に揺れすぎないように、安定化や許容範囲を持っています。
+特にスケールダウンは急に行われません。
+デフォルトでは、最近の推奨値を見ながら 5 分程度の安定化ウィンドウを置きます。
+
+この遅さは欠点だけではありません。
+負荷が一瞬下がっただけで Pod を減らし、その直後にまた増やすと、システムが振動します。
+スケールダウンを慎重にすることで、ユーザーから見た不安定さを減らします。
+
+### metrics-server の役割
+
+HPA は、自分で各 Pod の CPU 使用量を測りに行くわけではありません。
+Kubernetes では、metrics-server が kubelet から Pod と Node のメトリクスを集め、`metrics.k8s.io` API として提供します。
+HPA はその API から CPU 使用率を読みます。
+
+`kubectl top node` や `kubectl top pod` も、metrics-server の値を見ています。
+つまり metrics-server が入っていない、または kubelet からメトリクスを取れていない状態では、HPA は CPU 使用率を判断できません。
+`kubectl get hpa` の `TARGETS` が `<unknown>/70%` のようになります。
+
+kind では、ローカル教材用の kubelet 証明書の都合で metrics-server がそのまま動かないことがあります。
+このリポジトリの `deploy/k8s/README.md` では、metrics-server を入れた後に `--kubelet-insecure-tls` を追加する手順を載せています。
+本番で安易に使う設定ではありませんが、kind で HPA を学ぶための割り切りです。
+
+実検証では、kind + metrics-server の環境で HPA が次のように CPU 指標を報告することを確認しています。
+
+```txt title="kubectl get hpa -n shortlink の確認例"
+NAME        REFERENCE              TARGETS   MINPODS   MAXPODS   REPLICAS
+shortlink   Deployment/shortlink   cpu: 2%/70%   2         10        2
+```
+
+`cpu: 2%/70%` は、現在の平均 CPU 使用率が目標 70% に対して 2% 程度である、という意味です。
+この状態では負荷が低いので、HPA は最小値の 2 Pod を保ちます。
+
+## 手を動かす
+
+ここからは実際に HPA を観察します。
+リポジトリルートから始めます。
+Day 9 や Day 10 の kind クラスタが残っている場合は、クラスタ作成とイメージ読み込みは状況に合わせて省略できます。
+
+```sh
+kind create cluster --config deploy/kind-config.yaml --name shortlink
+docker build -f deploy/Dockerfile -t shortlink:dev app
+kind load docker-image shortlink:dev --name shortlink
+```
+
+base マニフェストを適用します。
+Day 11 では `03-hpa.yaml` も `base/` に含まれます。
+
+```sh
+kubectl apply -f deploy/k8s/base
+kubectl get deploy,pod,svc,hpa -n shortlink
+```
+
+負荷をかける前に、Day 10 参照の流れで PostgreSQL 構成へ切り替えます。
+`deploy/k8s/base` だけでは `STORAGE=memory` のままなので、Pod ごとにリンクデータが分離します。
+その状態で k6 が `POST /api/links` の後に別 Pod へ `GET /{code}` すると、作成したリンクが見つからず 404 になることがあります。
+
+```sh
+kubectl apply -f deploy/k8s/postgres/
+kubectl rollout restart deployment/shortlink -n shortlink
+kubectl rollout status deployment/shortlink -n shortlink
+```
+
+HPA の観察では、Service がどの Pod にリクエストを振り分けても同じリンクを読めることが前提です。
+これは今日のテーマであるステートレス設計そのものです。
+Pod ローカルのメモリに重要な状態を閉じ込めず、Postgres のような共有ストアに置くからこそ、Pod を増減しても正しさを保ったまま水平スケールできます。
+
+metrics-server がまだない場合、HPA の `TARGETS` は `<unknown>/70%` になることがあります。
+これは HPA が壊れているというより、CPU メトリクスの提供元がまだ無い状態です。
+次の URL は、この教材で検証済みの v0.8.1 に固定しています。
+
+```sh
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.8.1/components.yaml
+kubectl patch deployment metrics-server -n kube-system --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl rollout status deployment/metrics-server -n kube-system
+```
+
+メトリクスが見えるか確認します。
+
+```sh
+kubectl top node
+kubectl top pod -n shortlink
+kubectl get hpa -n shortlink
+```
+
+```txt
+NAME        REFERENCE              TARGETS     MINPODS   MAXPODS   REPLICAS
+shortlink   Deployment/shortlink   cpu: 2%/70% 2         10        2
+```
+
+実際の CPU 使用率は環境により変わります。
+大事なのは、`<unknown>` ではなく `cpu: 現在値/70%` の形で見えることです。
+
+:::note
+HPA が動いている間に `deploy/k8s/base/deployment.yaml` を再 apply すると、Deployment の `spec.replicas: 2` が一旦反映されます。
+HPA がすぐに現在の負荷を見て再調整しますが、Pod 数が一瞬 2 に戻っても驚かなくて大丈夫です。
+:::
+
+次は 3 つのターミナルを並べます。
+
+```sh
+# terminal 1
+kubectl get hpa -n shortlink -w
+
+# terminal 2
+kubectl port-forward svc/shortlink 8080:80 -n shortlink
+
+# terminal 3
+BASE_URL=http://localhost:8080 k6 run load/day11-scale.js
+```
+
+`load/day11-scale.js` は、一定到着率で `POST /api/links` を実行します。
+20 回に 1 回は作成した短縮コードへ `GET /{code}` し、`302` も確認します。
+デフォルトは `RATE=600`、`duration: '5m'` で、`http_req_duration` と `http_req_failed` の threshold も定義されています。
+
+負荷がかかると、`kubectl get hpa -w` の `TARGETS` が上がります。
+CPU 使用率が目標を超えた状態が観測されると、HPA は Deployment の replicas を増やします。
+
+同時に Pod 数も見ておくと、Deployment が新しい Pod を作る様子が分かります。
+
+```sh
+kubectl get pod -n shortlink -w
+```
+
+```txt
+TARGETS: cpu: 95%/70% -> REPLICAS: 3
+TARGETS: cpu: 88%/70% -> REPLICAS: 4
+new shortlink Pod: ContainerCreating -> Running
+```
+
+k6 側では、成功率と p95 レイテンシを見ます。
+負荷が強すぎる場合は、`RATE` を下げます。
+
+```sh
+RATE=300 BASE_URL=http://localhost:8080 k6 run load/day11-scale.js
+```
+
+負荷が終わったら、すぐに Pod が 2 個へ戻るとは限りません。
+デフォルトでは 5 分程度の安定化ウィンドウがあるため、しばらく `kubectl get hpa -w` と `kubectl get pod -w` を見続けます。
+
+```txt title="負荷停止後の観察ポイント"
+TARGETS が下がる
+REPLICAS はすぐには下がらない
+数分後に余分な Pod が減り、minReplicas の 2 に近づく
+```
+
+この待ち時間は、Kubernetes がサボっているわけではありません。
+一時的な負荷低下に反応してすぐ Pod を減らすと、直後の負荷再上昇でまた増やすことになります。
+その振動を避けるため、スケールアップよりスケールダウンは保守的に動きます。
+
+## クイズ
+
+<Quiz question="複数レプリカでプロセス内の連番カウンタが破綻する主な理由はどれですか？" choices={['各 Pod が独立したメモリで 1, 2, 3... を発行し、同じ code を作る可能性があるから', 'Service が必ず同じ Pod にだけ転送するから', 'ConfigMap は数字を保存できないから', 'HPA は連番の値を自動で同期するから']} answer={0} explanation="Pod は別プロセスなので、ローカル変数のカウンタは共有されません。複数 Pod が同じ初期値から採番すると、同じ code を発行して衝突します。" />
+
+<Quiz question="7 文字 base62 のランダムコードと衝突リトライについて、正しい理解はどれですか？" choices={['候補数は約 3.5 兆通りあり、衝突は小さいが 0 ではないため UNIQUE 制約とリトライを組み合わせる', '候補数が多いので保存先の一意制約は不要になる', '100 万件を超えた瞬間に必ず衝突する', 'ランダム生成では複数 Pod から同時に作成できない']} answer={0} explanation="ランダム空間は大きいですが、衝突確率は 0 ではありません。保存先で一意性を確認し、ErrConflict のときだけ作り直すことで正しさを保ちます。" />
+
+<Quiz question="HPA の基本式として最も近いものはどれですか？" choices={['desiredReplicas = ceil(currentReplicas × currentMetric / targetMetric)', 'desiredReplicas = currentReplicas - targetMetric', 'desiredReplicas = maxReplicas + minReplicas', 'desiredReplicas = CPU request の文字列長']} answer={0} explanation="HPA は現在のレプリカ数に、現在の指標が目標の何倍かを掛けて、必要なレプリカ数を見積もります。" />
+
+<Quiz question="負荷を止めても HPA のスケールダウンがすぐ起きない理由はどれですか？" choices={['短時間の上下で Pod 数が振動しないよう、スケールダウンには安定化ウィンドウがあるから', 'Pod は一度増えると Kubernetes では削除できないから', 'metrics-server は CPU 上昇だけを送信するから', 'Service の port-forward がスケールダウンを禁止するから']} answer={0} explanation="HPA はスケールダウンを保守的に行います。デフォルトでは 5 分程度の安定化ウィンドウがあり、一時的な負荷低下で急に Pod を減らさないようにします。" />
+
+<Quiz question="ステートレスなアプリケーションの説明として最も適切なものはどれですか？" choices={['どの Pod が処理してもよいよう、重要な状態を Pod ローカルのメモリに閉じ込めず共有ストアなどへ置く設計', 'メモリを一切使わないアプリケーション', 'ログを出さないアプリケーション', '必ず 1 Pod だけで動かすアプリケーション']} answer={0} explanation="ステートレスとは、リクエスト処理に必要な重要状態を特定 Pod のメモリに依存しない設計です。これにより、Pod の増減や再作成に強くなります。" />
+
+## 今日のまとめ
+
+今日は、水平スケールの前提としてステートレス設計を学びました。
+プロセス内の連番カウンタは、1 Pod では簡単でも、複数 Pod では同じ番号を発行して衝突します。
+Pod 再起動や新規 Pod 追加でもカウンタの履歴は共有されないため、水平スケールには向きません。
+
+Day 11 の shortlink は、7 文字 base62 のランダムコードを `crypto/rand` で生成します。
+一意性は保存先の主キー制約で確認し、`ErrConflict` のときだけ最大 5 回リトライします。
+ランダム空間は約 3.5 兆通りと大きく、1 回の作成が既存 100 万件に当たる確率は非常に小さいですが、0 ではありません。
+だからこそ、UNIQUE 制約とリトライを設計に含めます。
+
+Kubernetes 側では、HPA が CPU 使用率を見て Deployment の replicas を調整します。
+計算の直感は `desiredReplicas = ceil(currentReplicas × currentMetric / targetMetric)` です。
+HPA が CPU を見るには metrics-server が必要で、kind では教材用に `--kubelet-insecure-tls` の patch を当てました。
+実検証では、HPA が `cpu: 2%/70%`、`minReplicas: 2`、`maxReplicas: 10` を報告するところまで確認しています。
+
+k6 で負荷をかけると、HPA の `TARGETS` が上がり、Deployment の Pod 数が増えます。
+負荷を止めた後は、5 分程度の安定化ウィンドウにより、スケールダウンが少し遅れて起きます。
+これは余計な遅延ではなく、Pod 数の振動を抑えるための仕組みです。
+
+## 明日の予告
+
+Day 12 では、Prometheus と構造化ログに進みます。
+今日の HPA では CPU 使用率という単純な指標を見ました。
+明日は、アプリがどのようなリクエストを受け、どこで時間を使い、どのエラーが増えているのかを、メトリクスとログで観察できる形にしていきます。

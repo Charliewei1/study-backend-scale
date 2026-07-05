@@ -165,6 +165,49 @@ kubectl rollout undo deployment/shortlink -n shortlink
 kubectl rollout status deployment/shortlink -n shortlink
 ```
 
+## HPA を観察する
+
+Day 11 では `k8s/base/03-hpa.yaml` で HorizontalPodAutoscaler を追加します。HPA は metrics-server が集める CPU 使用率を使うため、kind では先に metrics-server を入れます。次の URL は、この教材で検証済みの v0.8.1 に固定しています。
+
+```sh
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.8.1/components.yaml
+```
+
+kind の kubelet 証明書はローカル教材用のため、そのままだと metrics-server が kubelet へ TLS 接続できないことがあります。次の patch で `--kubelet-insecure-tls` を付けます。
+
+```sh
+kubectl patch deployment metrics-server -n kube-system --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl rollout status deployment/metrics-server -n kube-system
+```
+
+metrics が見えるようになったか確認します。
+
+```sh
+kubectl top node
+kubectl top pod -n shortlink
+```
+
+HPA の状態は別ターミナルで見続けます。
+
+```sh
+kubectl get hpa -n shortlink -w
+```
+
+負荷スクリプトは作成したリンクを後続の GET で読むため、事前に `k8s/postgres` を適用して `STORAGE=postgres` に切り替えておきます。
+
+さらに別ターミナルで port-forward を実行します。
+
+```sh
+kubectl port-forward svc/shortlink 8080:80 -n shortlink
+```
+
+もう 1 つのターミナルで k6 を実行すると、CPU 使用率が上がったタイミングで `TARGETS` と `REPLICAS` が変わる様子を観察できます。
+
+```sh
+BASE_URL=http://localhost:8080 k6 run ../load/day11-scale.js
+```
+
 ## 後片付け
 
 マニフェストだけ削除する場合:

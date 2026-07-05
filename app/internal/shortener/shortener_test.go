@@ -2,46 +2,47 @@ package shortener
 
 import "testing"
 
-func TestEncode(t *testing.T) {
-	tests := []struct {
-		name string
-		id   uint64
-		want string
-	}{
-		{name: "zero", id: 0, want: "0"},
-		{name: "single digit", id: 1, want: "1"},
-		{name: "last one digit", id: 61, want: "Z"},
-		{name: "first two digits", id: 62, want: "10"},
-		{name: "two digits plus one", id: 63, want: "11"},
-		{name: "three digits", id: 62 * 62, want: "100"},
+func TestShortenerNextFormat(t *testing.T) {
+	s := New()
+
+	code, err := s.Next()
+	if err != nil {
+		t.Fatalf("Next returned error: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := Encode(tt.id); got != tt.want {
-				t.Fatalf("Encode(%d) = %q, want %q", tt.id, got, tt.want)
-			}
-		})
+	if len(code) != codeLength {
+		t.Fatalf("code length = %d, want %d; code=%q", len(code), codeLength, code)
+	}
+	assertBase62Code(t, code)
+}
+
+func TestShortenerNextUniqueAcrossManyGenerations(t *testing.T) {
+	s := New()
+	seen := make(map[string]struct{}, 10_000)
+
+	for i := 0; i < 10_000; i++ {
+		code, err := s.Next()
+		if err != nil {
+			t.Fatalf("Next returned error on iteration %d: %v", i, err)
+		}
+		assertBase62Code(t, code)
+		if _, ok := seen[code]; ok {
+			t.Fatalf("duplicate code generated on iteration %d: %q", i, code)
+		}
+		seen[code] = struct{}{}
 	}
 }
 
-func TestShortenerNext(t *testing.T) {
-	s := New()
+func assertBase62Code(t *testing.T, code string) {
+	t.Helper()
 
-	tests := []struct {
-		name string
-		want string
-	}{
-		{name: "first", want: "1"},
-		{name: "second", want: "2"},
-		{name: "third", want: "3"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := s.Next(); got != tt.want {
-				t.Fatalf("Next() = %q, want %q", got, tt.want)
-			}
-		})
+	for _, ch := range code {
+		switch {
+		case '0' <= ch && ch <= '9':
+		case 'a' <= ch && ch <= 'z':
+		case 'A' <= ch && ch <= 'Z':
+		default:
+			t.Fatalf("code %q contains non-base62 character %q", code, ch)
+		}
 	}
 }

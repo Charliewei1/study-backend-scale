@@ -13,7 +13,7 @@ import (
 	"github.com/study-backend-scale/shortlink/internal/storage"
 )
 
-const createLinkMaxAttempts = 64
+const createLinkMaxAttempts = 5
 
 // Handler は URL 短縮 API の依存関係をまとめた型です。
 type Handler struct {
@@ -118,8 +118,14 @@ func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
 
 	var code string
 	for attempt := 0; attempt < createLinkMaxAttempts; attempt++ {
-		code = h.shortener.Next()
-		err := h.store.Save(r.Context(), code, req.URL)
+		var err error
+		code, err = h.shortener.Next()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+
+		err = h.store.Save(r.Context(), code, req.URL)
 		if err == nil {
 			shortURL := h.shortURL(code)
 
@@ -137,9 +143,8 @@ func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 連番カウンタはプロセス内だけで持つため、再起動すると 1 に戻り、
-		// 永続化済みの短縮コードと衝突することがあります。ここでは教材上の暫定策として
-		// 次の連番で再試行し、Day 11 のランダム採番で根本的に衝突しにくい設計にします。
+		// 7 文字 base62 の空間は 62^7、約 3.5 兆通りあります。
+		// 衝突確率は極小ですが 0 ではないため、保存時の ErrConflict だけを小さく再試行します。
 	}
 
 	writeJSONError(w, http.StatusInternalServerError, "internal server error")

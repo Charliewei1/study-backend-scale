@@ -25,31 +25,20 @@ func newTestHandler() (http.Handler, *storage.MemoryStore) {
 
 func TestCreateLink(t *testing.T) {
 	tests := []struct {
-		name         string
-		body         string
-		wantStatus   int
-		wantLocation string
-		wantBody     map[string]string
+		name       string
+		body       string
+		wantStatus int
+		wantBody   map[string]string
 	}{
 		{
-			name:         "valid https url",
-			body:         `{"url":"https://example.com/articles/1"}`,
-			wantStatus:   http.StatusCreated,
-			wantLocation: testBaseURL + "/1",
-			wantBody: map[string]string{
-				"code":      "1",
-				"short_url": testBaseURL + "/1",
-			},
+			name:       "valid https url",
+			body:       `{"url":"https://example.com/articles/1"}`,
+			wantStatus: http.StatusCreated,
 		},
 		{
-			name:         "valid http url",
-			body:         `{"url":"http://example.com"}`,
-			wantStatus:   http.StatusCreated,
-			wantLocation: testBaseURL + "/1",
-			wantBody: map[string]string{
-				"code":      "1",
-				"short_url": testBaseURL + "/1",
-			},
+			name:       "valid http url",
+			body:       `{"url":"http://example.com"}`,
+			wantStatus: http.StatusCreated,
 		},
 		{
 			name:       "invalid json",
@@ -123,8 +112,9 @@ func TestCreateLink(t *testing.T) {
 			if got := rec.Header().Get("Content-Type"); got != "application/json" {
 				t.Fatalf("Content-Type = %q, want application/json", got)
 			}
-			if got := rec.Header().Get("Location"); got != tt.wantLocation {
-				t.Fatalf("Location = %q, want %q", got, tt.wantLocation)
+			if tt.wantStatus == http.StatusCreated {
+				assertCreateLinkResponse(t, rec, testBaseURL)
+				return
 			}
 			assertJSONBody(t, rec.Body.String(), tt.wantBody)
 		})
@@ -145,23 +135,41 @@ func TestCreateLinkRetriesAfterCodeConflict(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	if got := rec.Header().Get("Location"); got != testBaseURL+"/2" {
-		t.Fatalf("Location = %q, want %q", got, testBaseURL+"/2")
+	code := assertCreateLinkResponse(t, rec, testBaseURL)
+	if got, want := len(store.savedCodes), 2; got != want {
+		t.Fatalf("saved code count = %d, want %d; codes=%v", got, want, store.savedCodes)
 	}
-	assertJSONBody(t, rec.Body.String(), map[string]string{
-		"code":      "2",
-		"short_url": testBaseURL + "/2",
-	})
-	if got, want := strings.Join(store.savedCodes, ","), "1,2"; got != want {
-		t.Fatalf("saved codes = %q, want %q", got, want)
-	}
+	assertShortCode(t, store.savedCodes[0])
+	assertShortCode(t, store.savedCodes[1])
 
-	gotURL, err := store.Load(context.Background(), "2")
+	gotURL, err := store.Load(context.Background(), code)
 	if err != nil {
 		t.Fatalf("Load retried code returned error: %v", err)
 	}
 	if gotURL != "https://example.com/articles/1" {
 		t.Fatalf("Load retried code = %q, want original URL", gotURL)
+	}
+}
+
+func TestCreateLinkStopsAfterCodeConflicts(t *testing.T) {
+	store := &conflictOnceStore{
+		MemoryStore:        storage.NewMemoryStore(),
+		conflictsRemaining: createLinkMaxAttempts,
+	}
+	h := New(shortener.New(), store, testBaseURL, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/links", strings.NewReader(`{"url":"https://example.com/articles/1"}`))
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+	assertJSONBody(t, rec.Body.String(), map[string]string{
+		"error": "internal server error",
+	})
+	if got, want := len(store.savedCodes), createLinkMaxAttempts; got != want {
+		t.Fatalf("saved code count = %d, want %d; codes=%v", got, want, store.savedCodes)
 	}
 }
 
@@ -436,6 +444,43 @@ func (s *conflictOnceStore) Save(ctx context.Context, code, url string) error {
 		return storage.ErrConflict
 	}
 	return s.MemoryStore.Save(ctx, code, url)
+}
+
+func assertCreateLinkResponse(t *testing.T, rec *httptest.ResponseRecorder, baseURL string) string {
+	t.Helper()
+
+	var got createLinkResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response body is not JSON: %v; body=%s", err, rec.Body.String())
+	}
+	assertShortCode(t, got.Code)
+
+	wantShortURL := baseURL + "/" + got.Code
+	if got.ShortURL != wantShortURL {
+		t.Fatalf("short_url = %q, want %q", got.ShortURL, wantShortURL)
+	}
+	if location := rec.Header().Get("Location"); location != wantShortURL {
+		t.Fatalf("Location = %q, want %q", location, wantShortURL)
+	}
+
+	return got.Code
+}
+
+func assertShortCode(t *testing.T, code string) {
+	t.Helper()
+
+	if len(code) != 7 {
+		t.Fatalf("code length = %d, want 7; code=%q", len(code), code)
+	}
+	for _, ch := range code {
+		switch {
+		case '0' <= ch && ch <= '9':
+		case 'a' <= ch && ch <= 'z':
+		case 'A' <= ch && ch <= 'Z':
+		default:
+			t.Fatalf("code %q contains non-base62 character %q", code, ch)
+		}
+	}
 }
 
 func assertJSONBody(t *testing.T, body string, want map[string]string) {
