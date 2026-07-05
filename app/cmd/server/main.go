@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -37,15 +38,22 @@ func main() {
 		Addr:    addr,
 		Handler: h,
 	}
+	debugServer := newDebugServer()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		log.Printf("shortlink server listening on %s", addr)
 		errCh <- server.ListenAndServe()
 	}()
+	if debugServer != nil {
+		go func() {
+			log.Printf("debug server listening on %s", debugServer.Addr)
+			errCh <- debugServer.ListenAndServe()
+		}()
+	}
 
 	select {
 	case err := <-errCh:
@@ -58,6 +66,11 @@ func main() {
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("shutdown http server: %v", err)
 		}
+		if debugServer != nil {
+			if err := debugServer.Shutdown(shutdownCtx); err != nil {
+				log.Printf("shutdown debug server: %v", err)
+			}
+		}
 		cancel()
 	}
 
@@ -66,6 +79,27 @@ func main() {
 		log.Printf("flush analytics: %v", err)
 	}
 	cancel()
+}
+
+func newDebugServer() *http.Server {
+	addr := os.Getenv("DEBUG_ADDR")
+	if addr == "" {
+		return nil
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	return &http.Server{
+		Addr: addr,
+		// pprof は内部状態を見せるため、本番 API と同じポートではなく
+		// DEBUG_ADDR の別ポートで明示的に有効化したときだけ公開する。
+		Handler: mux,
+	}
 }
 
 func newStore() (storage.Storage, func()) {

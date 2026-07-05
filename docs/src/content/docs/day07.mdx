@@ -1,0 +1,389 @@
+---
+title: "Day 7 - 計測: k6 ベースラインと pprof"
+description: k6 で URL 短縮サービスのベースラインを測り、スループット、レイテンシ、パーセンタイル、thresholds、pprof の基本を学びます。
+sidebar:
+  label: Day 7
+  order: 7
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+## 今日のゴール
+
+- 「推測するな、計測せよ」という姿勢を、スケール改善の出発点として説明できるようになる。
+- スループットとレイテンシの違いを説明できるようになる。
+- 平均値だけを見る危険と、p50、p95、p99 の意味を理解する。
+- k6 の VU モデルと `ramping-vus` の負荷のかけ方を読めるようになる。
+- `thresholds` が、性能条件を自動判定するための約束だと理解する。
+- `load/day07-baseline.js` の `setup` から 90/10 混合シナリオまでを読めるようになる。
+- `DEBUG_ADDR` で pprof を別ポートに出す理由を説明できるようになる。
+- 今日の実測値を、15 日間の比較に使うベースラインとして記録できるようになる。
+
+## 解説
+
+Day 6 では、Docker Compose で Go アプリと Postgres を一緒に起動しました。
+保存先がメモリやローカルファイルではなく、ネットワーク越しの Postgres になったことで、構成は本番に少し近づきました。
+
+今日は、その構成に負荷をかけます。
+目的は「限界まで壊すこと」ではありません。
+まず、今のアプリがどのくらいの速さで、どのくらい安定して応答しているのかを測ります。
+
+スケーラビリティの学習で大切なのは、感覚で話さないことです。
+「たぶん速い」「Postgres だから遅いはず」「キャッシュを入れれば良くなるはず」という推測だけでは、改善したのか、悪化したのか、どこが詰まっているのかを判断できません。
+
+今日の合言葉は、推測するな、計測せよ、です。
+この数字を Day 8 以降の比較の基準にします。
+
+### ベースラインとは何か
+
+ベースラインは、改善前の基準値です。
+今日のアプリは、Redis キャッシュも Kubernetes の複数レプリカもまだない、Compose で起動した app + Postgres 構成です。
+この状態で負荷試験を実行し、リクエスト数、失敗率、レイテンシを記録します。
+改善は、比較できて初めて改善です。
+Day 8 の Redis キャッシュ、Day 11 の複数レプリカや HPA でも、今日の数値が比較の物差しになります。
+
+### スループットとレイテンシ
+
+負荷試験で最初に見るのは、スループットとレイテンシです。
+
+スループットは、単位時間あたりにどれだけ処理できたかです。
+HTTP サービスなら、1 秒あたりのリクエスト数、つまり req/s で見ることが多いです。
+k6 の出力では `http_reqs` の右側に `26.97/s` のような値が出ます。
+
+レイテンシは、1 リクエストが返ってくるまでにどれだけ時間がかかったかです。
+k6 の出力では `http_req_duration` に `avg`、`p(90)`、`p(95)`、`max` などが出ます。
+
+スループットとレイテンシは別の指標です。
+たくさん処理できていても、一部のユーザーだけ極端に遅いかもしれません。
+逆に、1 リクエストは速くても、同時アクセスが増えた瞬間に失敗するかもしれません。
+そのため、負荷試験では `http_reqs` と req/s、`http_req_duration`、`http_req_failed` と `checks` を一緒に見ます。
+
+### 平均は嘘をつく
+
+レイテンシを見るとき、平均値だけに頼ると危険です。
+平均は便利ですが、ユーザー体験の悪い部分を隠すことがあります。
+
+たとえば 10 件中 9 件は 2ms、1 件だけ 200ms なら、平均はおよそ 21.8ms です。
+平均だけを見ると悪くなさそうですが、200ms を踏んだユーザーにとっては遅い体験です。
+
+そこでパーセンタイルを見ます。
+p50 は 50%、p95 は 95%、p99 は 99% のリクエストがその時間以内に終わったという意味です。
+p50 は中央値とも呼ばれます。
+
+p95 が 100ms なら、100 件中 95 件は 100ms 以内に返り、残り 5 件はそれより遅い可能性があります。
+つまり p95 は、平均よりも「遅い側の体験」に目を向けるための指標です。
+本番サービスでは、平均が良くても p95 や p99 が悪いと問題になります。
+
+### k6 の VU モデル
+
+今日使う負荷試験ツールは k6 です。
+k6 では、スクリプトの `default` 関数を繰り返し実行する仮想ユーザーを VU、Virtual User と呼びます。
+1 VU は、1 人のユーザーが「リクエストを投げる、少し待つ、また次の操作をする」という流れを繰り返すイメージです。
+
+`load/day07-baseline.js` では、`ramping-vus` を使っています。
+
+```js title="load/day07-baseline.js"
+export const options = {
+  scenarios: {
+    baseline: {
+      executor: 'ramping-vus',
+      stages: [
+        { duration: '30s', target: 20 },
+        { duration: '1m', target: 50 },
+        { duration: '30s', target: 0 },
+      ],
+    },
+  },
+};
+```
+
+これは、最初の 30 秒で 0 VU から 20 VU へ増やし、次の 1 分で 50 VU へ増やし、最後の 30 秒で 0 VU へ戻す、合計 2 分間の負荷試験です。
+段階的に増やすことで、どのあたりからレイテンシや失敗率が変わるのかを見やすくします。
+
+### thresholds は性能のテスト
+
+k6 の `thresholds` は、負荷試験の合格条件です。
+単に数値を見るだけではなく、「この条件を満たさなければ失敗」と定義できます。
+
+```js title="load/day07-baseline.js"
+thresholds: {
+  http_req_duration: ['p(95)<100'],
+  http_req_failed: ['rate<0.01'],
+},
+```
+
+`http_req_duration: ['p(95)<100']` は p95 レイテンシが 100ms 未満、`http_req_failed: ['rate<0.01']` は HTTP 失敗率が 1% 未満であることを期待します。
+threshold が失敗すると、k6 の終了コードは 0 ではなくなります。
+CI では、性能条件を満たさない変更を失敗として扱えます。
+
+### スクリプトのウォークスルー
+
+今日の負荷試験スクリプトは `load/day07-baseline.js` です。
+接続先は `BASE_URL` 環境変数で変えられ、指定しなければ `http://localhost:8080` です。
+
+```js title="load/day07-baseline.js"
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
+```
+
+最初に `setup` が実行されます。
+ここでは、リダイレクト試験で使う短縮 URL を 100 件作っています。
+
+```js title="load/day07-baseline.js"
+export function setup() {
+  const links = [];
+
+  for (let i = 0; i < 100; i += 1) {
+    const url = `https://example.com/day07/seed/${i}`;
+    const res = createLink(url);
+    const code = responseCode(res);
+    const ok = check(res, {
+      'setup create returns 201': (r) => r.status === 201,
+      'setup create has code': () => Boolean(code),
+    });
+```
+
+`setup` で作った `links` は、`default` 関数に渡されます。
+負荷試験本体では、90% の確率で既存の短縮 URL へアクセスし、10% の確率で新しい短縮 URL を作ります。
+
+```js title="load/day07-baseline.js"
+export default function (data) {
+  if (Math.random() < 0.9) {
+    const link = data.links[Math.floor(Math.random() * data.links.length)];
+    const res = http.get(`${BASE_URL}/${link.code}`, {
+      redirects: 0,
+      tags: { name: 'GET /{code}' },
+    });
+```
+
+URL 短縮サービスでは、1 回作った短縮 URL が何度もクリックされるため、一般に作成よりリダイレクトのほうが多くなります。
+そのため、今日のシナリオは create 10%、redirect 90% の混合にしています。
+
+リダイレクトでは `redirects: 0` を指定しています。
+これは、k6 にリダイレクト先の `https://example.com/...` まで追いかけさせないためです。
+測りたいのは shortlink アプリが `302` と `Location` を返すまでの時間であり、外部サイトの応答時間ではありません。
+
+POST 側では `201` と `code` の存在を確認し、GET 側では `302` と `Location` が期待した URL と一致することを確認します。
+
+最後に `sleep(1)` があります。
+これは、各 VU が 1 回操作したあとに 1 秒待つという意味です。
+待ち時間を入れることで、休みなく連打する機械的な負荷ではなく、少しだけ人間の操作に近い形にしています。
+
+### 今日の実測値
+
+このリポジトリで、Compose + Postgres 構成を起動し、2 分間の `ramping-vus` で 0 VU から 20 VU、50 VU、0 VU と負荷をかけた実測値は次の通りです。
+
+```txt title="Day 7 baseline 実測値"
+http_reqs......................: 3250   26.97/s
+http_req_duration..............: avg=1.76ms p(90)=2.51ms p(95)=3.04ms max=9.37ms
+http_req_failed................: 0.00%
+checks.........................: 6500   100.00%
+```
+
+この結果では、HTTP リクエストは 3250 件、平均スループットは 26.97 req/s でした。
+`http_req_duration` の平均は 1.76ms、p95 は 3.04ms、最大でも 9.37ms、`http_req_failed` は 0%、`checks` は 6500 件すべて成功しています。
+
+ここで大事なのは、数字の絶対値だけではありません。
+Day 8 で Redis キャッシュを入れたとき、p95 は下がるのか。
+Day 11 で複数レプリカにしたとき、同じ条件で req/s はどう変わるのか。
+その比較の出発点が今日の 3250 リクエスト、26.97 req/s、p95 3.04ms です。
+
+`load/README.md` には、計測結果メモの表があります。
+今日の結果は、たとえば次のように書き込みます。
+
+```md title="load/README.md"
+| Day | 条件 | p95 (ms) | iterations | http_reqs | メモ |
+| --- | --- | ---: | ---: | ---: | --- |
+| Day7 baseline | キャッシュなし、単体アプリ、Compose + Postgres、0→20→50VU/2分 | 3.04 | 3150 | 3250 | 26.97 req/s、avg 1.76ms、失敗 0%、checks 6500/6500 |
+```
+
+`iterations` は 3150 です。
+`http_reqs` が 3250 なのは、負荷試験本体の 3150 回に加えて、`setup` が 100 件の短縮 URL を作っているためです。
+
+### pprof を別ポートに出す理由
+
+Go には `net/http/pprof` という標準のプロファイリング機能があります。
+CPU の使われ方、メモリの使われ方、goroutine の状態などを HTTP 経由で調べられます。
+
+ただし、pprof はアプリの内部状態を見せる入口です。
+本番 API と同じポートに何となく出すものではありません。
+そのため、このリポジトリでは `DEBUG_ADDR` が設定されたときだけ、別の HTTP サーバとして pprof を公開します。
+
+```go title="app/cmd/server/main.go"
+func newDebugServer() *http.Server {
+	addr := os.Getenv("DEBUG_ADDR")
+	if addr == "" {
+		return nil
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+```
+
+`heap` は `/debug/pprof/` の一覧から開けます。
+そして `DEBUG_ADDR` が空なら `nil` を返し、デバッグサーバを起動しません。
+
+```go title="app/cmd/server/main.go"
+debugServer := newDebugServer()
+
+if debugServer != nil {
+	go func() {
+		log.Printf("debug server listening on %s", debugServer.Addr)
+		errCh <- debugServer.ListenAndServe()
+	}()
+}
+```
+
+別ポートにする理由は、通常のユーザー向け API とデバッグ用 API を分け、`DEBUG_ADDR` を設定したときだけ明示的に有効化し、将来の本番構成で内部ネットワークからだけ見せる設計にしやすくするためです。
+
+pprof の基本として、まず見るのは `profile` と `heap` です。
+`profile` は指定した秒数のあいだ、どの関数で CPU 時間を使っていたかを見ます。
+`heap` は、どの経路でメモリが確保されているかを見るメモリプロファイルです。
+
+今日の段階では、pprof で深い最適化をしなくて構いません。
+大事なのは、負荷をかけながら内部を観察する入口を持つことです。
+
+## 手を動かす
+
+まず Compose で app と Postgres を起動します。
+Day 6 と同じく、`deploy/` に移動してから実行します。
+
+```sh
+cd deploy
+docker compose up -d --build
+```
+
+ヘルスチェックで、アプリが起動していることを確認します。
+
+```sh
+curl http://localhost:8080/healthz
+```
+
+期待出力です。
+
+```txt
+ok
+```
+
+次に、リポジトリルートへ戻って k6 を実行します。
+
+```sh
+cd ..
+k6 run load/day07-baseline.js
+```
+
+接続先を明示したい場合は、次のように `BASE_URL` を指定します。
+
+```sh
+BASE_URL=http://localhost:8080 k6 run load/day07-baseline.js
+```
+
+出力では、まず `checks` を見ます。
+ここが 100% なら、シナリオ上の期待、つまり `201`、`302`、`Location`、`code` の確認がすべて通っています。
+
+```txt
+checks.........................: 100.00% 6500 out of 6500
+```
+
+次に `http_req_failed` を見ます。
+今日の実測では 0% です。
+
+```txt
+http_req_failed................: 0.00%
+```
+
+次に `http_req_duration` を見ます。
+平均だけでなく、`p(90)`、`p(95)`、`max` を一緒に読みます。
+
+```txt
+http_req_duration..............: avg=1.76ms p(90)=2.51ms p(95)=3.04ms max=9.37ms
+```
+
+最後に `http_reqs` を見ます。
+合計リクエスト数と、1 秒あたりのリクエスト数を確認します。
+
+```txt
+http_reqs......................: 3250   26.97/s
+```
+
+この結果を `load/README.md` の表へ転記します。
+このタスクでは教材ページだけを作るため実際には編集しませんが、自分の学習メモでは次のように残します。
+
+```md title="load/README.md"
+| Day7 baseline | キャッシュなし、単体アプリ、Compose + Postgres、0→20→50VU/2分 | 3.04 | 3150 | 3250 | 26.97 req/s、avg 1.76ms、失敗 0%、checks 6500/6500 |
+```
+
+pprof も開いてみます。
+通常の Compose 起動では `DEBUG_ADDR` を有効にしていないため、いったん app だけ止め、同じ Compose ネットワーク上でデバッグポート付きの app を起動します。
+Postgres は起動したままにします。
+
+```sh
+cd deploy
+docker compose stop app
+docker compose run --rm --service-ports -p 6060:6060 -e DEBUG_ADDR=:6060 app
+```
+
+別のターミナルで、pprof の一覧を開きます。
+
+```sh
+open http://localhost:6060/debug/pprof/
+```
+
+CPU プロファイルを見るには、負荷をかけている最中に次を実行します。
+30 秒間サンプルを集め、ブラウザで結果を見ます。
+
+```sh
+go tool pprof -http=:0 'http://localhost:6060/debug/pprof/profile?seconds=30'
+```
+
+メモリの様子を見るには、heap を開きます。
+
+```sh
+go tool pprof -http=:0 http://localhost:6060/debug/pprof/heap
+```
+
+pprof の画面では、最初からすべてを理解しようとしなくて構いません。
+まず、どの関数が大きく表示されているか、アプリの処理なのか、標準ライブラリや DB ドライバの処理なのかを見ます。
+CPU なら「時間を使っている関数」、heap なら「メモリを確保している経路」を探す、という入口だけ押さえておきましょう。
+
+確認が終わったら、片付けます。
+
+```sh
+docker compose down -v
+```
+
+## クイズ
+
+<Quiz question="p95 レイテンシの意味として正しいものはどれですか？" choices={['全リクエストの 95% がその時間以内に終わったという意味', '全リクエストの平均時間が 95ms という意味', '95 番目の VU だけの応答時間という意味', '失敗したリクエストが 95% あるという意味']} answer={0} explanation="p95 は 95 パーセンタイルです。全体の 95% がその時間以内に終わり、残り 5% はそれより遅い可能性があります。" />
+
+<Quiz question="平均レイテンシとパーセンタイルの違いとして正しいものはどれですか？" choices={['平均は全体をならした値で、パーセンタイルは遅い側の分布を見やすい', '平均は常に p95 より大きくなる', 'p95 は成功率を表し、時間とは関係がない', '平均だけ見れば一部の遅いリクエストも必ず発見できる']} answer={0} explanation="平均は外れ値や遅い一部の体験を隠すことがあります。p95 や p99 を見ると、遅い側のユーザー体験に気づきやすくなります。" />
+
+<Quiz question="k6 の VU とは何ですか？" choices={['スクリプトの default 関数を繰り返し実行する仮想ユーザー', 'Go アプリの goroutine 数を直接指定する値', 'Postgres の接続数だけを表す値', 'HTTP レスポンスのステータスコードを分類する機能']} answer={0} explanation="VU は Virtual User です。各 VU が仮想的な利用者として default 関数を繰り返し実行し、sleep を含めた操作の流れを再現します。" />
+
+<Quiz question="k6 の thresholds が失敗したとき、終了コードはどうなりますか？" choices={['0 ではない終了コードになり、CI では失敗として扱える', '必ず 0 のままで、ログだけに警告が出る', 'HTTP 500 を自動で返す', 'Postgres コンテナを自動で停止する']} answer={0} explanation="thresholds は性能条件の自動判定です。条件を満たさない場合は k6 の終了コードが非 0 になり、CI で性能劣化を検知できます。" />
+
+## 今日のまとめ
+
+今日は、Compose + Postgres 構成の shortlink に k6 で負荷をかけ、Day 7 のベースラインを測りました。
+スループットは単位時間あたりの処理量、レイテンシは 1 リクエストの応答時間です。
+平均だけでは遅い一部の体験を見落とすため、p50、p95、p99 のようなパーセンタイルを一緒に見ます。
+
+k6 では、VU が仮想ユーザーとしてスクリプトを繰り返し実行します。
+今日の `ramping-vus` は、2 分間で 0 VU から 20 VU、50 VU、0 VU と段階的に負荷を変えました。
+シナリオは URL 短縮サービスらしく、redirect 90%、create 10% の混合です。
+
+このリポジトリでの実測値は、`http_reqs` 3250、26.97 req/s、`http_req_duration` の avg 1.76ms、p95 3.04ms、max 9.37ms、`http_req_failed` 0%、`checks` 6500 件すべて成功でした。
+この数字を、Day 8 以降の改善と比較する基準にします。
+
+pprof では、`DEBUG_ADDR` を設定したときだけ別ポートでデバッグ用 HTTP サーバを起動します。
+通常 API と内部観察用の入口を分けることで、安全に扱いやすくなります。
+まずは `profile` で CPU、`heap` でメモリを見る入口を覚えておきましょう。
+
+## 明日の予告
+
+Day 8 では、Redis キャッシュを入れて読み取りを速くします。
+URL 短縮サービスは、作成よりリダイレクトのほうが多い read-heavy なサービスです。
+今日測った p95 3.04ms、26.97 req/s というベースラインと比べながら、キャッシュがどの数値に効くのかを見ていきます。
