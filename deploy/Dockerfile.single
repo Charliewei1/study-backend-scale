@@ -1,0 +1,22 @@
+# Comparison-only single-stage image for Day 5 lessons.
+# Build from the repository root with:
+# docker build -f deploy/Dockerfile.single -t shortlink:single app
+
+FROM golang:1.24
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /usr/local/bin/shortlink \
+    ./cmd/server
+
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["/usr/local/bin/shortlink"]

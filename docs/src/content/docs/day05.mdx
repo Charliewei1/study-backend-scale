@@ -1,0 +1,378 @@
+---
+title: Day 5 - Docker でコンテナ化
+description: Go 製 URL 短縮サービスを Docker イメージに包み、コンテナ、イメージレイヤ、ビルドキャッシュ、multi-stage build、distroless、非 root 実行を学びます。
+sidebar:
+  label: Day 5
+  order: 5
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+## 今日のゴール
+
+- コンテナとは何かを、VM との違いを含めて説明できるようになる。
+- namespace と cgroups が、プロセスを分離して制限する仕組みだと理解する。
+- Docker イメージがレイヤの積み重ねでできていることを説明できるようになる。
+- `go.mod` と `go.sum` を先に `COPY` する理由を、ビルドキャッシュの観点で説明できるようになる。
+- multi-stage build と single-stage build の違いを、今回の Dockerfile で読めるようになる。
+- distroless と非 root 実行が、攻撃面の縮小につながることを理解する。
+- `CGO_ENABLED=0` と静的リンクの意味を、コンテナ実行と結びつけて説明できるようになる。
+- Docker で `shortlink` を build / run し、`curl` と `docker images` で確認する。
+
+## 解説
+
+Day 4 までに、Go の URL 短縮サービスはかなりアプリらしくなりました。
+API 契約、永続化、クリック統計、graceful shutdown まで入っています。
+ただし、まだ実行方法は主に `go run ./cmd/server` でした。
+
+今日は、この Go サーバを Docker イメージに包みます。
+Docker イメージにすると、実行に必要なものをひとまとめにできます。
+自分のマシンに Go が入っているか、同じ OS か、同じライブラリがあるかに依存しにくくなります。
+
+### コンテナとは何か
+
+コンテナは、隔離された環境で動くプロセスです。
+よく「軽量な仮想マシン」と説明されますが、正確には仮想マシンとは仕組みが違います。
+
+仮想マシンは、ホスト OS の上に仮想的なハードウェアを作り、その上でゲスト OS を起動します。
+そのため、VM の中にはカーネルも含めた OS 一式があります。
+一方、コンテナはホスト OS のカーネルを共有しながら、プロセス、ファイルシステム、ネットワークなどを分離して見せます。
+
+```txt title="VM とコンテナのざっくり比較"
+VM
+  アプリ + ライブラリ + ゲスト OS + 仮想ハードウェア
+  隔離は強いが、起動と配布は重くなりやすい
+
+コンテナ
+  アプリ + 実行に必要なファイル
+  ホスト OS のカーネルを共有し、プロセス単位で軽く分離する
+```
+
+コンテナの分離には、Linux の namespace と cgroups が使われます。
+namespace は「見える範囲」を分ける仕組みです。
+たとえば、コンテナの中では自分のプロセスだけが見え、独自のネットワークインターフェースやファイルシステムを持っているように見えます。
+
+cgroups は、CPU やメモリなどのリソース使用量を制限、計測する仕組みです。
+コンテナがホスト全体のメモリを使い切らないようにしたり、CPU 使用量を制御したりできます。
+
+コンテナは「小さな OS」ではなく、分離されたプロセスです。
+この見方があると、後日 Kubernetes で Pod や resource limits を扱うときにも混乱しにくくなります。
+
+### Docker イメージはレイヤの積み重ね
+
+Docker でアプリを動かすときは、まずイメージを作ります。
+イメージは、実行に必要なファイルシステムとメタデータをまとめたものです。
+コンテナは、そのイメージから起動した実行中のプロセスだと考えられます。
+
+Dockerfile の各命令は、多くの場合レイヤを作ります。
+たとえば `COPY`、`RUN`、`ENV` のような命令です。
+Docker は、同じ入力で同じ命令を実行するなら、過去の結果をキャッシュとして再利用できます。
+
+レイヤキャッシュが効くと、毎回すべてを最初からビルドしなくてよくなります。
+Go の依存モジュールのダウンロードには時間がかかるため、今回の Dockerfile は `go.mod` と `go.sum` を先にコピーしています。
+
+```dockerfile title="deploy/Dockerfile"
+FROM golang:1.24 AS builder
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/shortlink \
+    ./cmd/server
+```
+
+最初に `go.mod` と `go.sum` だけをコピーし、`go mod download` を実行します。
+そのあとで、アプリ本体のソースコードを `COPY . .` しています。
+ソースコードを少し直しただけなら、`go.mod` と `go.sum` は変わらないため、依存モジュールをダウンロードするレイヤはキャッシュできます。
+Docker は `COPY . .` 以降だけをやり直せばよくなります。
+
+最初から `COPY . .` していたら、Go ファイルを 1 行変えただけでも、その後ろにある `go mod download` のキャッシュが無効になります。
+変わりにくいものを先に置き、変わりやすいものを後ろに置くのが基本です。
+
+### .dockerignore で build context を小さくする
+
+Docker build では、最後の引数に指定したディレクトリが build context として Docker に送られます。
+今回の README にある通り、リポジトリルートから次のように実行します。
+
+```sh
+docker build -f deploy/Dockerfile -t shortlink:dev app
+```
+
+最後の `app` が build context です。
+つまり、Dockerfile は `deploy/Dockerfile` にありますが、`COPY . .` の `.` はリポジトリルートではなく `app/` を指します。
+
+`app/.dockerignore` は、build context に含めないものを指定します。
+
+```dockerignore title="app/.dockerignore"
+.git
+.gitignore
+
+# Local editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Build and test output
+bin/
+dist/
+coverage.out
+*.test
+
+# Local runtime data
+*.db
+*.db-*
+tmp/
+```
+
+`.git` やエディタ設定、テスト出力、ローカル DB は、コンテナのビルドには不要です。
+不要なファイルを build context に入れないことで、転送量を減らし、キャッシュの無駄な無効化も避けられます。
+`*.db` や `tmp/` を除外している点は、Day 3 の SQLite 確認と関係します。
+ローカルで作ったデータベースファイルを、うっかりイメージへ焼き込まないためです。
+### multi-stage build
+
+今回の本命は `deploy/Dockerfile` です。
+この Dockerfile は multi-stage build になっています。
+ビルド用の stage と、実行用の stage を分けています。
+
+```dockerfile title="deploy/Dockerfile"
+FROM golang:1.24 AS builder
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/shortlink \
+    ./cmd/server
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+ENV PORT=8080
+EXPOSE 8080
+
+COPY --from=builder /out/shortlink /shortlink
+
+USER nonroot:nonroot
+ENTRYPOINT ["/shortlink"]
+```
+
+1 つ目の stage は `golang:1.24` です。
+Go コンパイラやビルドに必要なツールが入っており、`go mod download` と `go build` はこの stage で実行します。
+2 つ目の stage は `gcr.io/distroless/static-debian12:nonroot` です。
+ここには Go コンパイラを入れず、`COPY --from=builder /out/shortlink /shortlink` でビルド済みバイナリだけをコピーします。
+
+これが multi-stage build の核心です。
+ビルドには Go ツールチェーンが必要ですが、実行には完成したバイナリだけあればよい。
+
+今回の実測では、multi-stage 版の最終イメージサイズは約 19.5MB です。
+Go ツールチェーンを含む single-stage 版と比べると、かなり小さくなります。
+サイズが小さいと、push / pull が速くなり、デプロイやスケールアウトの待ち時間も減ります。
+
+### single-stage 版と何が違うのか
+
+比較用に `deploy/Dockerfile.single` も用意されています。
+これは、ビルドと実行を同じ `golang:1.24` イメージの中で行います。
+
+```dockerfile title="deploy/Dockerfile.single"
+FROM golang:1.24
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /usr/local/bin/shortlink \
+    ./cmd/server
+
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["/usr/local/bin/shortlink"]
+```
+
+この Dockerfile でもアプリは動きます。
+ただし、最終イメージの中に Go コンパイラ、モジュールキャッシュ、shell、OS パッケージなどが残ります。
+実行時には不要なものまで配布することになります。
+
+multi-stage 版は `golang:1.24` でコンパイルし、distroless に完成バイナリだけを置きます。
+single-stage 版は `golang:1.24` の中でコンパイルし、そのまま実行するため、Go ツールチェーンや shell も最終イメージに含みます。
+
+### distroless と非 root 実行
+
+実行用 stage には `gcr.io/distroless/static-debian12:nonroot` を使っています。
+distroless は、アプリ実行に必要な最小限のファイルだけを入れたイメージです。
+一般的な Linux ディストリビューションにある shell、パッケージマネージャ、デバッグ用ツールなどは基本的に入っていません。
+
+shell がないと、コンテナの中で `sh` を起動して調べる使い方はできません。
+しかし、これはセキュリティ上の利点でもあります。
+もしアプリに脆弱性があり、攻撃者がコマンド実行に近いことをできたとしても、shell や余計なツールがなければ次の行動を取りにくくなります。
+
+これを攻撃面の縮小と呼びます。
+入っているものが少ないほど、攻撃に使える道具や、脆弱性を持つ可能性のある部品も少なくなります。
+
+さらに今回の Dockerfile は、最後に非 root ユーザーで実行しています。
+
+```dockerfile title="deploy/Dockerfile"
+USER nonroot:nonroot
+ENTRYPOINT ["/shortlink"]
+```
+
+コンテナは分離されていますが、プロセスであることに変わりはありません。
+root 権限で動いていると、コンテナ内でできる操作の範囲が広がります。
+非 root で動かすと、ファイル書き込みや権限操作の範囲を狭くできます。
+
+distroless と非 root は、どちらも「壊れたときの被害を小さくする」ための守りです。
+小さいイメージは速いだけではありません。
+余計な実行環境を持たないことは、運用時のリスクを減らす設計でもあります。
+
+### CGO_ENABLED=0 と静的リンク
+
+ビルド命令には `CGO_ENABLED=0 GOOS=linux` が付いています。
+
+```dockerfile title="deploy/Dockerfile"
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/shortlink \
+    ./cmd/server
+```
+
+`GOOS=linux` は、Linux 用のバイナリを作る指定です。
+Docker コンテナは Linux 環境で動くため、ホストが macOS でも Linux 向けにビルドします。
+
+`CGO_ENABLED=0` は、Go から C のコードを呼ぶ cgo を無効にする指定です。
+cgo を使わない場合、Go は外部の C ライブラリに依存しないバイナリを作りやすくなります。
+このようなバイナリは、静的リンクに近い形で、実行時に必要な共有ライブラリが少なくなります。
+
+distroless の `static` イメージは、名前の通り静的にリンクされたバイナリを置く用途に向いています。
+もし実行時に必要な共有ライブラリがイメージ内に無ければ、コンテナは起動できません。
+そのため、`CGO_ENABLED=0` で Go 単体で動く Linux バイナリを作り、distroless へコピーする設計にしています。
+
+Day 3 で SQLite ドライバに `modernc.org/sqlite` を使った理由も、ここにつながります。
+このドライバは cgo 不要で扱えるため、`CGO_ENABLED=0` の Docker ビルドに乗せやすいです。
+もし cgo 前提のライブラリを使う場合は、ビルド環境、実行イメージ、必要な共有ライブラリをもっと丁寧に揃える必要があります。
+
+`-trimpath` はローカルのファイルパスを残しにくくする指定です。
+`-ldflags="-s -w"` は、シンボルテーブルやデバッグ情報を削り、バイナリサイズを小さくする指定です。
+実行用 stage の `ENV PORT=8080` はアプリのデフォルトポートを設定し、`EXPOSE 8080` は 8080 番で待ち受ける意図を示すメタデータです。
+ホストからアクセスするには、`docker run -p 8080:8080` のようにポートを公開します。
+
+## 手を動かす
+
+ここでは、リポジトリルートから Docker イメージをビルドして実行します。
+ターミナルを 2 つ使います。
+1 つ目で `docker run` し、2 つ目で `curl` と `docker images` を実行します。
+
+まず、multi-stage 版をビルドします。
+
+```sh
+docker build -f deploy/Dockerfile -t shortlink:dev app
+```
+
+期待出力は、最後に `shortlink:dev` へタグ付けされる形です。
+BuildKit を使っている場合、表示は環境によって少し変わります。
+
+```txt
+=> [builder 4/6] RUN go mod download
+=> [builder 6/6] RUN CGO_ENABLED=0 GOOS=linux go build ...
+=> exporting to image
+=> naming to docker.io/library/shortlink:dev
+```
+
+次に、コンテナを起動します。
+
+```sh
+docker run --rm -p 8080:8080 shortlink:dev
+```
+
+期待するログは次の形です。
+
+```txt
+shortlink server listening on :8080
+```
+
+別のターミナルでヘルスチェックします。
+
+```sh
+curl http://localhost:8080/healthz
+```
+
+期待出力は次の通りです。
+
+```txt
+ok
+```
+
+次に、比較用の single-stage 版もビルドします。
+1 つ目のターミナルで動いているコンテナは `Ctrl+C` で止めて構いません。
+
+```sh
+docker build -f deploy/Dockerfile.single -t shortlink:single app
+```
+
+サイズを比較します。
+
+```sh
+docker images shortlink
+```
+
+期待出力は、multi-stage 版がかなり小さく見える形です。
+サイズは Docker のバージョンやベースイメージの更新で少し変わりますが、multi-stage 版は約 19.5MB です。
+
+```txt
+REPOSITORY   TAG      IMAGE ID       CREATED          SIZE
+shortlink    dev      ...            ...              19.5MB
+shortlink    single   ...            ...              1GB前後
+```
+
+## クイズ
+
+<Quiz question="Docker のレイヤキャッシュが無効になりやすい条件はどれですか？" choices={['そのレイヤの入力ファイルや命令が変わったとき', 'コンテナを docker run しただけのとき', 'EXPOSE を書いたイメージへ curl したとき', 'タグ名に dev を使ったとき']} answer={0} explanation="Docker は命令と入力が同じならレイヤを再利用できます。COPY するファイルや RUN の命令が変わると、そのレイヤ以降は再実行されやすくなります。" />
+
+<Quiz question="multi-stage build の主な利点はどれですか？" choices={['ビルドに必要なツールと実行に必要な成果物を分け、最終イメージを小さくできる', 'Go のテストを自動で全部削除できる', 'コンテナが VM と同じカーネルを持てる', 'Dockerfile を書かなくてもイメージを作れる']} answer={0} explanation="今回の Dockerfile は golang:1.24 でビルドし、distroless へ完成バイナリだけをコピーしています。Go ツールチェーンを最終イメージに残さないため、小さくできます。" />
+
+<Quiz question="distroless イメージに shell が無いことの意味として正しいものはどれですか？" choices={['コンテナ内で /bin/sh を起動する調査はできないが、攻撃に使える余計な道具も減る', 'HTTP サーバを起動できない', 'Docker のポート公開が使えない', 'Go のバイナリは必ず動かなくなる']} answer={0} explanation="distroless は shell やパッケージマネージャなどを基本的に含みません。不便さはありますが、攻撃面を小さくする効果があります。" />
+
+<Quiz question="CGO_ENABLED=0 を指定する主な理由はどれですか？" choices={['cgo を使わず、外部 C ライブラリへの実行時依存が少ない Linux バイナリを作りやすくするため', 'Go の goroutine を無効にするため', 'Docker の build context を空にするため', 'HTTP のポート番号を 0 にするため']} answer={0} explanation="CGO_ENABLED=0 は cgo を無効にします。distroless/static のような小さい実行イメージへ置くために、実行時依存の少ないバイナリを作る意図があります。" />
+
+## 今日のまとめ
+
+今日は、`shortlink` を Docker でコンテナ化しました。
+コンテナは、namespace で見える範囲を分け、cgroups でリソースを制御する、隔離されたプロセスです。
+VM のようにゲスト OS 全体を起動するのではなく、ホスト OS のカーネルを共有しながらアプリを分離します。
+
+Docker イメージはレイヤの積み重ねです。
+`go.mod` と `go.sum` を先に `COPY` して `go mod download` することで、依存関係が変わらない限りモジュールダウンロードのキャッシュを使いやすくしています。
+`app/.dockerignore` では、`.git`、エディタ設定、テスト出力、ローカル DB など、イメージに不要なものを build context から外しました。
+
+multi-stage build では、`golang:1.24` の builder stage でコンパイルし、実行用の distroless stage へ完成バイナリだけをコピーしました。
+比較用の single-stage 版は Go ツールチェーンごと残るため大きくなります。
+今回の multi-stage 版は約 19.5MB で、配布や起動の面でも扱いやすいサイズです。
+
+distroless と非 root 実行は、攻撃面を小さくするための設計です。
+shell やパッケージマネージャが無いことは、コンテナ内での手作業調査を難しくします。
+一方で、攻撃者に使われる道具も減らせます。
+`CGO_ENABLED=0` は、静的リンクに近い、実行時依存の少ない Linux バイナリを作るための重要な指定でした。
+
+## 明日の予告
+
+Day 6 では、Docker Compose と Postgres に進みます。
+今日作ったアプリコンテナに加えて、データベースコンテナを一緒に起動します。
+
+SQLite はローカルで扱いやすい保存先でした。
+明日は、複数プロセスからネットワーク越しに共有できる Postgres へ移行し、Compose のサービス名 DNS、healthcheck、volume、起動順序を学びます。
