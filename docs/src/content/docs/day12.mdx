@@ -1,0 +1,408 @@
+---
+title: "Day 12 - 可観測性: Prometheus と structured logging"
+description: Prometheus メトリクス、JSON 構造化ログ、RED メソッド、PromQL、Grafana ダッシュボードを通して、サービスを観察できる形にします。
+sidebar:
+  label: Day 12
+  order: 12
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+:::note[このページのコードについて]
+このページは Day 12 時点のコードを解説しています。当時のコードは `git checkout day12` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+:::
+
+## 今日のゴール
+
+- 可観測性の三本柱、メトリクス、ログ、トレースの役割を説明できるようになる。
+- RED メソッドの Rate、Errors、Duration を URL 短縮サービスに対応づけられるようになる。
+- counter、gauge、histogram の違いを説明できるようになる。
+- 平均ではなく `histogram_quantile` で p95 を見る理由を理解する。
+- ルートラベルのカーディナリティと、`/{code}` を `redirect` に正規化する理由を説明できるようになる。
+- JSON 構造化ログが、grep だけの運用より強い理由を理解する。
+- Prometheus UI と Grafana で、リクエスト数、p95、キャッシュヒット率を確認できるようになる。
+
+## 解説
+
+Day 11 では、URL 短縮サービスを水平スケールしやすい形へ近づけました。Pod を増やせるようになったら、次に必要なのは「増やしたあと何が起きているかを見られること」です。何 req/s 来ているのか、5xx は増えているのか、p95 レイテンシは悪化しているのか、Redis キャッシュは効いているのか。これらを人間の勘ではなく、機械的に答えられる形にします。
+
+### 可観測性の三本柱
+
+可観測性では、よく三本柱という言い方をします。メトリクス、ログ、トレースです。
+
+メトリクスは、数値を時系列で集めたものです。Prometheus は、アプリの `/metrics` を定期的に取りに行き、PromQL で問い合わせられるようにします。たとえばリクエスト数、エラー率、p95 レイテンシ、キャッシュヒット率です。
+
+ログは、ある時点で起きたイベントの記録です。今日のアプリは HTTP リクエストごとに `method`、`path`、`status`、`duration_ms`、`remote` を JSON で出します。メトリクスで「5xx が増えた」と分かったあと、どのリクエストが失敗したのかを追うときに使います。
+
+トレースは、1 つのリクエストが複数サービスをまたいで流れる様子を追うものです。API、DB、外部 API のどこで時間を使ったかを span として見ます。Day 12 では実装しませんが、メトリクスで異常を見つけ、ログで詳細を絞り、必要ならトレースで経路を見る、という役割分担を覚えておきましょう。
+
+### RED メソッド
+
+Web API の入口を見るときは、RED メソッドが便利です。RED は Rate、Errors、Duration の頭文字です。
+
+Rate は流量です。shortlink なら、`POST /api/links` や `GET /{code}` が何 req/s 来ているかを見ます。Errors はエラー率です。HTTP なら 5xx の割合、場合によっては 404 の急増も見ます。Duration は処理時間です。平均だけでなく、p95 や p99 を見ます。一部のユーザーだけ極端に遅い状態は、平均値では見逃されやすいからです。
+
+### counter、gauge、histogram
+
+Prometheus のメトリクス型は、意味を分けて使います。counter は増えるだけの値です。`http_requests_total` はリクエストごとに 1 増えます。`cache_hits_total` と `cache_misses_total` も、ヒットやミスのたびに増えます。
+
+gauge は増えたり減ったりする現在値です。現在の goroutine 数、キュー長、メモリ使用量のような値に向いています。今日のカスタムメトリクスには gauge はありませんが、「今いくつか」を表す型です。
+
+histogram は、観測値をバケットに分けて数えます。今日の `http_request_duration_seconds` は、リクエスト時間を histogram として記録します。`0.005 秒以下が何件、0.01 秒以下が何件...` のように累積バケットを持ちます。
+
+```go title="app/internal/metrics/metrics.go"
+HTTPRequestsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{Name: "http_requests_total"},
+	[]string{"method", "route", "status"},
+)
+HTTPRequestDurationSeconds = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{Name: "http_request_duration_seconds", Buckets: prometheus.DefBuckets},
+	[]string{"route"},
+)
+CacheHitsTotal = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_hits_total"})
+CacheMissesTotal = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_misses_total"})
+```
+
+`http_requests_total` は `method`、`route`、`status` の組み合わせごとに系列が分かれます。たとえば `GET` の `redirect` で `302`、`POST` の `/api/links` で `201` です。
+
+### なぜ平均ではなく p95 を見るのか
+
+平均は便利ですが、遅いリクエストを隠します。100 リクエストのうち 99 件が 10ms、1 件が 2 秒なら、平均は約 30ms です。平均だけなら悪くなさそうですが、2 秒待たされたユーザーは困っています。
+
+p95 は、速い順に並べたとき 95% のリクエストがその時間以下で終わった、という値です。Prometheus の histogram は個々の観測値を全部保存せず、バケットごとの累積数を保存します。そのバケットから「95% 点はこのあたり」と推定する関数が `histogram_quantile` です。
+
+```promql title="route ごとの p95 レイテンシ"
+histogram_quantile(
+  0.95,
+  sum(rate(http_request_duration_seconds_bucket[1m])) by (le, route)
+)
+```
+
+`le` ラベルはバケット境界です。`histogram_quantile` はバケット境界ごとのカウントが必要なので、`sum by (le, route)` のように `le` を残して集計します。
+
+### ルートラベルとカーディナリティ
+
+Prometheus は、ラベルの組み合わせごとに別の時系列を作ります。この系列数の多さをカーディナリティと呼びます。短縮コードをそのままラベルに入れると、`/abc1234`、`/x9Yz001` のようにコードの数だけ系列が増えます。リンクが 100 万件あれば、Prometheus 側にも大量の系列ができます。
+
+そのため Day 12 の middleware は、`/{code}` を `redirect` に正規化します。
+
+```go title="app/internal/middleware/metrics.go"
+if pattern == "/{code}" {
+	return "redirect"
+}
+```
+
+個々の code はログや DB で追えば十分です。メトリクスのラベルには、集計軸として意味があり、値の種類が増えすぎないものを選びます。
+
+Day 13 のレートリミットで返る 429 は、ルーティング前に拒否されるため `route="unknown"` として記録されます。
+
+### HTTP middleware で記録する
+
+メトリクスは HTTP middleware で記録します。開始時刻を取り、下流のハンドラを呼び、ステータスと経過時間を記録します。
+
+```go title="app/internal/middleware/metrics.go"
+start := time.Now()
+rec := newStatusResponseWriter(w)
+next.ServeHTTP(rec, r)
+metrics.RecordHTTPRequest(r.Method, routeLabel(r), rec.status, time.Since(start))
+```
+
+標準の `http.ResponseWriter` は、あとからステータスコードを読めません。そのため `statusResponseWriter` で `WriteHeader` を包み、実際に返したステータスを覚えます。この部品があるので、`http_requests_total{method="GET",route="redirect",status="302"}` のような実カウントが取れます。
+
+### `/metrics` を公開する
+
+Prometheus は、アプリから push してもらうのではなく、自分から scrape しに行きます。アプリ側は `/metrics` を公開します。
+
+```go title="app/cmd/server/main.go"
+mux.Handle("GET /metrics", promhttp.Handler())
+mux.Handle("/", appHandler)
+h := middleware.RequestLogger(logger)(middleware.Metrics(mux))
+```
+
+`promhttp.Handler()` は、登録済み collector を Prometheus のテキスト形式で返します。Go ランタイムの標準メトリクスに加えて、Day 12 の `http_requests_total`、`http_request_duration_seconds_bucket`、`cache_hits_total`、`cache_misses_total` も出ます。
+
+`/metrics`、`/healthz`、`/readyz` は監視や probe のためのインフラ由来のリクエストなので、RED のリクエストメトリクスとリクエストログからは除外します。
+
+### キャッシュヒット率を見る
+
+Day 8 の Redis cache-aside は、Day 12 で Prometheus から見えるようになりました。hit と miss は counter として増やします。
+
+```go title="app/internal/cache/redis.go"
+if url, err := s.client.Get(ctx, key); err == nil {
+	s.hits.Add(1)
+	metrics.RecordCacheHit()
+	return url, nil
+} else {
+	s.misses.Add(1)
+	metrics.RecordCacheMiss()
+	if !errors.Is(err, redis.Nil) {
+		slog.Warn("redis get failed; falling back to storage", "code", code, "error", err)
+	}
+}
+```
+
+キャッシュヒット率は、hit の rate を hit と miss の rate の合計で割ります。
+
+```promql title="キャッシュヒット率"
+(sum(rate(cache_hits_total[1m])) or vector(0))
+/
+clamp_min((sum(rate(cache_hits_total[1m])) or vector(0)) + (sum(rate(cache_misses_total[1m])) or vector(0)), 0.001)
+```
+
+同じ code に繰り返しアクセスすると、最初は miss、その後は hit になりやすいため、値は 1 に近づきます。
+
+### 構造化ログ
+
+Day 12 の `cmd/server/main.go` は、標準ライブラリの `log/slog` を JSON handler で使います。ログレベルは `LOG_LEVEL` で `debug`、`warn`、`error`、既定の `info` を選べます。
+
+```go title="app/internal/middleware/requestlog.go"
+logger.Info("http request",
+	"method", r.Method,
+	"path", r.URL.Path,
+	"status", rec.status,
+	"duration_ms", float64(time.Since(start).Microseconds())/1000,
+	"remote", remoteAddr(r),
+)
+```
+
+実際のログは 1 行 JSON です。
+
+```json title="アプリのリクエストログ例"
+{"time":"...","level":"INFO","msg":"http request","method":"GET","path":"/abc1234","status":302,"duration_ms":1.42,"remote":"172.20.0.1"}
+```
+
+構造化ログが grep より強い理由は、フィールドで機械的に絞れることです。`status == 500`、`method == "POST"`、`duration_ms > 1000` のように、名前と型を使って検索できます。さらに Loki、Elasticsearch、Cloud Logging のような集約基盤へ流せば、Pod が何個あっても同じクエリで探せます。
+
+### Prometheus と Grafana の設定
+
+監視スタックは、通常の Compose に `compose.monitoring.yaml` を重ねて起動します。Prometheus は `9090`、Grafana は `${GRAFANA_PORT:-3000}:3000` で公開されます。
+
+```yaml title="deploy/compose.monitoring.yaml"
+prometheus:
+  image: prom/prometheus:v2.55.1
+  ports: ["9090:9090"]
+grafana:
+  image: grafana/grafana:11.5.2
+  ports: ["${GRAFANA_PORT:-3000}:3000"]
+```
+
+Grafana のホスト側ポートは `GRAFANA_PORT` で変更できます。既定は `3000` です。Prometheus は Compose ネットワーク上の `app:8080` を scrape します。
+
+```yaml title="deploy/prometheus/prometheus.yml"
+scrape_configs:
+  - job_name: shortlink
+    metrics_path: /metrics
+    static_configs:
+      - targets: [app:8080]
+```
+
+Grafana は provisioning で datasource と dashboard を自動登録します。datasource は `http://prometheus:9090`、ダッシュボード名は `Shortlink RED and Cache` です。
+
+```promql title="Grafana ダッシュボードの主なクエリ"
+sum(rate(http_requests_total[5m])) by (route)
+(sum(rate(http_requests_total{status=~"5.."}[5m])) or vector(0)) / clamp_min(sum(rate(http_requests_total[5m])), 0.001)
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, route))
+(sum(rate(cache_hits_total[5m])) or vector(0)) / clamp_min((sum(rate(cache_hits_total[5m])) or vector(0)) + (sum(rate(cache_misses_total[5m])) or vector(0)), 0.001)
+```
+
+### PromQL 入門
+
+`http_requests_total` は累積 counter です。流量を見るには、一定時間あたりの増加率にします。
+
+```promql title="直近 1 分のリクエスト増加率"
+rate(http_requests_total[1m])
+```
+
+ルートごとの req/s は `sum by` でまとめます。
+
+```promql title="route ごとの req/s"
+sum(rate(http_requests_total[1m])) by (route)
+```
+
+5xx エラー率は、5xx の rate を全体の rate で割ります。
+
+```promql title="5xx エラー率"
+(sum(rate(http_requests_total{status=~"5.."}[1m])) or vector(0)) / clamp_min(sum(rate(http_requests_total[1m])), 0.001)
+```
+
+5xx が一度も発生していないと、`status=~"5.."` に一致する系列がなく、左辺が `no data` になります。`or vector(0)` を足すと、エラーがない状態を欠損ではなく 0 として表示できます。
+
+p95 レイテンシとキャッシュヒット率は、先ほどの `histogram_quantile` と hit/miss の式で確認します。
+
+## 手を動かす
+
+リポジトリルートから、アプリと監視スタックをまとめて起動します。
+
+```sh
+cd deploy
+docker compose -f compose.yaml -f compose.monitoring.yaml up -d --build
+```
+
+起動状態を確認します。
+
+```sh
+docker compose -f compose.yaml -f compose.monitoring.yaml ps
+```
+
+期待出力は次の形です。
+
+```txt
+SERVICE      STATUS
+app          Up
+postgres     Up (healthy)
+redis        Up (healthy)
+prometheus   Up
+grafana      Up
+```
+
+アプリのヘルスチェックを確認します。
+
+```sh
+curl http://localhost:8080/healthz
+```
+
+```txt
+ok
+```
+
+Prometheus target が up か確認します。実検証では、`compose.yaml` と `compose.monitoring.yaml` を重ねた構成で target が up になっています。
+
+```sh
+curl -s 'http://localhost:9090/api/v1/query?query=up{job="shortlink"}'
+```
+
+期待出力は、最後の値が `"1"` の形です。
+
+```json
+{"status":"success","data":{"result":[{"metric":{"instance":"app:8080","job":"shortlink"},"value":[...,"1"]}]}}
+```
+
+Grafana の health API も確認します。`GRAFANA_PORT` を変えた場合は、そのポートを使ってください。実検証では `/api/health` が HTTP 200 を返しています。
+
+```sh
+curl -i http://localhost:${GRAFANA_PORT:-3000}/api/health
+```
+
+```http
+HTTP/1.1 200 OK
+
+{"commit":"...","database":"ok","version":"11.5.2"}
+```
+
+短縮リンクを 1 つ作ります。
+
+```sh
+CODE=$(curl -s -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/day12/observability"}' \
+  | sed -E 's/.*"code":"([^"]+)".*/\1/')
+echo "$CODE"
+```
+
+期待出力は、7 文字のランダム base62 コードです。
+
+```txt
+aB3xY9Q
+```
+
+curl で少し負荷をかけます。
+
+```sh
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w '%{http_code}\n' "http://localhost:8080/$CODE"
+done
+```
+
+期待出力は `302` が並ぶ形です。
+
+```txt
+302
+302
+302
+```
+
+アプリの JSON ログを確認します。実検証では、ログに `method`、`path`、`status`、`duration_ms` が出ています。
+
+```sh
+docker compose -f compose.yaml -f compose.monitoring.yaml logs app --tail=5
+```
+
+```json
+{"time":"...","level":"INFO","msg":"http request","method":"GET","path":"/aB3xY9Q","status":302,"duration_ms":1.23,"remote":"172.20.0.1"}
+```
+
+次に `/metrics` を直接見ます。
+
+```sh
+curl -s http://localhost:8080/metrics | grep -E 'http_requests_total|cache_(hits|misses)_total' | head -20
+```
+
+期待出力です。実検証では、`http_requests_total{route="redirect",status="302"}` が実カウントされます。
+
+```txt
+# TYPE http_requests_total counter
+http_requests_total{method="GET",route="redirect",status="302"} 10
+cache_hits_total 9
+cache_misses_total 1
+```
+
+histogram のバケットも見ます。
+
+```sh
+curl -s http://localhost:8080/metrics | grep 'http_request_duration_seconds_bucket{route="redirect"' | head
+```
+
+```txt
+http_request_duration_seconds_bucket{route="redirect",le="0.005"} 10
+http_request_duration_seconds_bucket{route="redirect",le="0.01"} 10
+```
+
+Prometheus UI は `http://localhost:9090` です。Graph 画面で、まず次を実行します。
+
+```promql
+rate(http_requests_total[1m])
+```
+
+`GET`、`redirect`、`302` の系列が出ていれば、リダイレクトの counter から rate を計算できています。続けて、ルートごとの rate、p95、キャッシュヒット率を確認します。
+
+```promql
+sum(rate(http_requests_total[1m])) by (route)
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[1m])) by (le, route))
+(sum(rate(cache_hits_total[1m])) or vector(0)) / clamp_min((sum(rate(cache_hits_total[1m])) or vector(0)) + (sum(rate(cache_misses_total[1m])) or vector(0)), 0.001)
+```
+
+Grafana は `http://localhost:${GRAFANA_PORT:-3000}` で開きます。`GRAFANA_PORT` を変えた場合は、そのポートを使ってください。ログインは `admin` / `admin` です。Dashboards から `Shortlink` フォルダの `Shortlink RED and Cache` を開きます。期待するパネルは `Request Rate`、`Error Rate`、`Latency p95`、`Cache Hit Ratio` です。Prometheus の scrape interval は 15 秒なので、アクセス直後は少し待ってから更新してください。
+
+確認が終わったら片付けます。
+
+```sh
+docker compose -f compose.yaml -f compose.monitoring.yaml down -v
+```
+
+## クイズ
+
+<Quiz question="counter と gauge の説明として正しいものはどれですか？" choices={['counter は通常増えるだけの累積値で、gauge は増減する現在値を表す', 'counter は現在値、gauge は必ず増える累積値を表す', 'counter は文字列ログ専用で、gauge は HTTP 専用である', 'counter も gauge も Prometheus では同じ意味で区別しない']} answer={0} explanation="counter はリクエスト総数のように増えるだけの値に使います。gauge は現在のキュー長やメモリ使用量のように増減する値に向いています。" />
+
+<Quiz question="PromQL の rate(http_requests_total[1m]) が表すものはどれですか？" choices={['直近 1 分の counter 増加率、つまり秒あたりのリクエスト数の推定', '起動してからの総リクエスト数そのもの', '直近 1 分の最大レイテンシ', 'HTTP ステータスコードを 1 分ごとに書き換える処理']} answer={0} explanation="http_requests_total は累積 counter です。rate(...[1m]) は、その counter が直近 1 分でどれくらいの速さで増えているかを計算します。" />
+
+<Quiz question="p95 レイテンシを見るとき histogram_quantile が必要になる理由はどれですか？" choices={['histogram のバケット累積数から、95% 点がどのあたりかを推定するため', '平均値を必ず 0 に近づけるため', 'ログの JSON を Prometheus に変換するため', 'counter を gauge に変換するため']} answer={0} explanation="Prometheus histogram は個々の観測値ではなくバケットごとの累積数を持ちます。histogram_quantile はそのバケット情報から p95 などの分位数を推定します。" />
+
+<Quiz question="メトリクスラベルに短縮コードそのものを入れない主な理由はどれですか？" choices={['code の種類だけ時系列が増え、Prometheus のカーディナリティが爆発するから', 'Prometheus は英数字をラベル値にできないから', '短縮コードを入れると HTTP 302 が 200 に変わるから', 'Grafana は route ラベルを表示できないから']} answer={0} explanation="短縮コードは値の種類が非常に多くなります。ラベルに入れるとコードごとに時系列が作られ、保存量やクエリ性能に悪影響が出ます。そのため /{code} は redirect に正規化します。" />
+
+<Quiz question="RED メソッドの 3 要素として正しいものはどれですか？" choices={['Rate、Errors、Duration', 'Readiness、Events、Deployment', 'Redis、Endpoint、Docker', 'Request、Encode、Decode']} answer={0} explanation="RED は Rate、Errors、Duration です。Web API の入口で、流量、エラー率、処理時間をまず見るための考え方です。" />
+
+## 今日のまとめ
+
+今日は、URL 短縮サービスを観察できる形にしました。可観測性の三本柱は、メトリクス、ログ、トレースです。Day 12 では Prometheus メトリクスと JSON 構造化ログを実装し、トレースは概念として扱いました。
+
+メトリクスでは、RED メソッドを軸に `http_requests_total` と `http_request_duration_seconds` を追加しました。リクエスト数は counter、レイテンシは histogram です。平均だけでは遅い一部のリクエストを見逃しやすいため、`histogram_quantile` で p95 を見ます。
+
+ラベル設計では、`/{code}` を raw code のまま扱わず、`redirect` に正規化しました。Prometheus はラベル値の組み合わせごとに時系列を作るため、短縮コードのように種類が増え続ける値を入れるとカーディナリティが爆発します。
+
+ログは `log/slog` の JSON handler で構造化しました。`method`、`path`、`status`、`duration_ms` のようなフィールドがあるため、あとから機械的に絞り込めます。これは単なる grep より強く、集約基盤へ流したときにも同じフィールドで検索できます。
+
+実検証では Prometheus target が up になり、Grafana の `/api/health` は 200 を返し、アプリログには `method/path/status/duration_ms` が出て、`http_requests_total{method="GET",route="redirect",status="302"}` が実カウントされることを確認しています。
+
+## 明日の予告
+
+Day 13 では、レートリミットと回復性に進みます。今日の可観測性で「どれくらい来ているか」「どこが遅いか」「エラーが増えているか」を見られるようになりました。明日は、その情報を前提に、過剰なリクエストからサービスを守る token bucket、429、タイムアウト、フォールバック、リトライの考え方を学びます。

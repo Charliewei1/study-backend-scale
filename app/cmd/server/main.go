@@ -3,18 +3,21 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/study-backend-scale/shortlink/internal/analytics"
 	"github.com/study-backend-scale/shortlink/internal/cache"
 	"github.com/study-backend-scale/shortlink/internal/handler"
+	"github.com/study-backend-scale/shortlink/internal/middleware"
 	"github.com/study-backend-scale/shortlink/internal/shortener"
 	"github.com/study-backend-scale/shortlink/internal/storage"
 )
@@ -22,6 +25,9 @@ import (
 const shutdownTimeout = 5 * time.Second
 
 func main() {
+	logger := newLogger()
+	slog.SetDefault(logger)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -37,7 +43,11 @@ func main() {
 	clicks := analytics.New(store, 1024)
 
 	baseURL := fmt.Sprintf("http://localhost:%s", port)
-	h := handler.New(shortener.New(), store, baseURL, clicks, cacheStats)
+	appHandler := handler.New(shortener.New(), store, baseURL, clicks, cacheStats)
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.Handler())
+	mux.Handle("/", appHandler)
+	h := middleware.RequestLogger(logger)(middleware.Metrics(mux))
 
 	addr := ":" + port
 	server := &http.Server{
@@ -51,12 +61,12 @@ func main() {
 
 	errCh := make(chan error, 2)
 	go func() {
-		log.Printf("shortlink server listening on %s", addr)
+		slog.Info("shortlink server listening", "addr", addr)
 		errCh <- server.ListenAndServe()
 	}()
 	if debugServer != nil {
 		go func() {
-			log.Printf("debug server listening on %s", debugServer.Addr)
+			slog.Info("debug server listening", "addr", debugServer.Addr)
 			errCh <- debugServer.ListenAndServe()
 		}()
 	}
@@ -64,17 +74,17 @@ func main() {
 	select {
 	case err := <-errCh:
 		if err != nil && err != http.ErrServerClosed {
-			log.Fatal(err)
+			fatal("http server failed", "error", err)
 		}
 	case <-ctx.Done():
 		stop()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("shutdown http server: %v", err)
+			slog.Error("shutdown http server", "error", err)
 		}
 		if debugServer != nil {
 			if err := debugServer.Shutdown(shutdownCtx); err != nil {
-				log.Printf("shutdown debug server: %v", err)
+				slog.Error("shutdown debug server", "error", err)
 			}
 		}
 		cancel()
@@ -82,9 +92,30 @@ func main() {
 
 	flushCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	if err := clicks.Close(flushCtx); err != nil {
-		log.Printf("flush analytics: %v", err)
+		slog.Error("flush analytics", "error", err)
 	}
 	cancel()
+}
+
+func newLogger() *slog.Logger {
+	var level slog.Level
+	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+}
+
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
 }
 
 func withRedisCache(store storage.Storage) (storage.Storage, func(), cache.StatsProvider) {
@@ -100,11 +131,11 @@ func withRedisCache(store storage.Storage) (storage.Storage, func(), cache.Stats
 		WriteTimeout: 200 * time.Millisecond,
 	})
 	cached := cache.NewRedisStore(store, client)
-	log.Printf("redis cache enabled at %s", redisAddr)
+	slog.Info("redis cache enabled", "addr", redisAddr)
 
 	return cached, func() {
 		if err := client.Close(); err != nil {
-			log.Printf("close redis client: %v", err)
+			slog.Error("close redis client", "error", err)
 		}
 	}, cached
 }
@@ -142,28 +173,28 @@ func newStore() (storage.Storage, func()) {
 
 		store, err := storage.NewSQLiteStore(context.Background(), path)
 		if err != nil {
-			log.Fatalf("initialize sqlite storage: %v", err)
+			fatal("initialize sqlite storage", "error", err)
 		}
 		return store, func() {
 			if err := store.Close(); err != nil {
-				log.Printf("close sqlite storage: %v", err)
+				slog.Error("close sqlite storage", "error", err)
 			}
 		}
 	case "postgres":
 		databaseURL := os.Getenv("DATABASE_URL")
 		if databaseURL == "" {
-			log.Fatal("DATABASE_URL is required when STORAGE=postgres")
+			fatal("DATABASE_URL is required when STORAGE=postgres")
 		}
 
 		store, err := storage.NewPostgresStore(context.Background(), databaseURL)
 		if err != nil {
-			log.Fatalf("initialize postgres storage: %v", err)
+			fatal("initialize postgres storage", "error", err)
 		}
 		return store, func() {
 			store.Close()
 		}
 	default:
-		log.Fatalf("unsupported STORAGE %q; want memory, sqlite, or postgres", os.Getenv("STORAGE"))
+		fatal("unsupported STORAGE; want memory, sqlite, or postgres", "storage", os.Getenv("STORAGE"))
 		return nil, func() {}
 	}
 }

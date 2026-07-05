@@ -4,11 +4,12 @@ package cache
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/study-backend-scale/shortlink/internal/metrics"
 	"github.com/study-backend-scale/shortlink/internal/storage"
 )
 
@@ -88,11 +89,13 @@ func (s *RedisStore) Load(ctx context.Context, code string) (string, error) {
 	key := cacheKey(code)
 	if url, err := s.client.Get(ctx, key); err == nil {
 		s.hits.Add(1)
+		metrics.RecordCacheHit()
 		return url, nil
 	} else {
 		s.misses.Add(1)
+		metrics.RecordCacheMiss()
 		if !errors.Is(err, redis.Nil) {
-			log.Printf("redis get %q failed; falling back to storage: %v", code, err)
+			slog.Warn("redis get failed; falling back to storage", "code", code, "error", err)
 		}
 	}
 
@@ -102,7 +105,7 @@ func (s *RedisStore) Load(ctx context.Context, code string) (string, error) {
 	}
 
 	if err := s.client.SetEX(ctx, key, url, s.ttl); err != nil {
-		log.Printf("redis set %q failed: %v", code, err)
+		slog.Warn("redis set failed", "code", code, "error", err)
 	}
 	return url, nil
 }
