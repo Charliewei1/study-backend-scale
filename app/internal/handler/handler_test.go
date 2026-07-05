@@ -49,6 +49,30 @@ func TestCreateLink(t *testing.T) {
 			},
 		},
 		{
+			name:       "unknown field",
+			body:       `{"url":"https://example.com","owner":"alice"}`,
+			wantStatus: http.StatusBadRequest,
+			wantBody: map[string]string{
+				"error": "invalid json",
+			},
+		},
+		{
+			name:       "trailing garbage",
+			body:       `{"url":"https://example.com"} trailing`,
+			wantStatus: http.StatusBadRequest,
+			wantBody: map[string]string{
+				"error": "invalid json",
+			},
+		},
+		{
+			name:       "body too large",
+			body:       `{"url":"https://example.com/` + strings.Repeat("a", createLinkMaxBodyBytes) + `"}`,
+			wantStatus: http.StatusRequestEntityTooLarge,
+			wantBody: map[string]string{
+				"error": "request body too large",
+			},
+		},
+		{
 			name:       "empty url",
 			body:       `{"url":""}`,
 			wantStatus: http.StatusBadRequest,

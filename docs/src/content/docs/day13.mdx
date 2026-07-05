@@ -1,0 +1,445 @@
+---
+title: "Day 13 - レートリミットと回復性: 入口で守る"
+description: token bucket による IP 別レートリミット、429 と Retry-After、HTTP タイムアウト、リクエストボディ防御、graceful degradation を学びます。
+sidebar:
+  label: Day 13
+  order: 13
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+:::note[このページのコードについて]
+このページは Day 13 時点のコードを解説しています。当時のコードは `git checkout day13` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+:::
+
+## 今日のゴール
+
+- 暴走クライアント、急なスパイク、カスケード障害から入口で守る理由を説明できるようになる。
+- token bucket の `rate` と `burst` を、補充速度と短時間の余裕として理解する。
+- token bucket と sliding window の違いを説明できるようになる。
+- `429 Too Many Requests`、`Retry-After`、`X-RateLimit-*` ヘッダの意味を読めるようになる。
+- IP 別制限の落とし穴として、`X-Forwarded-For` の信頼境界と NAT 背後の利用者を説明できるようになる。
+- `http.Server`、リクエスト `context`、Redis/DB 呼び出しのタイムアウトを階層で設計できるようになる。
+- `MaxBytesReader`、`DisallowUnknownFields`、末尾 JSON チェックでリクエストボディを守る理由を理解する。
+- Day 8 の Redis フォールバックを、graceful degradation の例として復習する。
+- k6 で意図的にレートリミットを超え、429 の割合とヘッダを観察できるようになる。
+
+## 解説
+
+Day 12 では、Prometheus と structured logging でサービスを観察できるようにしました。見えるようになったら、次は入口で守ります。今日のテーマは、レートリミットと回復性です。
+
+公開 API は、正常なユーザーだけが丁寧に使うとは限りません。ブラウザや SDK のバグ、クライアントの再試行ループ、スクリプトの連打、SNS からの急な流入、悪意あるリクエストが同じ入口へ来ます。それらを全部 DB や Redis まで通すと、1 つのクライアントの問題がサービス全体の問題になります。
+
+### なぜ守りが要るのか
+
+守りがない API は、入口から奥まで一直線です。`POST /api/links` が連打されると、Go の goroutine、DB 接続、Redis、ログ、メトリクス、CPU が同時に消費されます。最初は 1 クライアントの暴走でも、共有リソースが詰まれば他の利用者まで遅くなります。
+
+急なスパイクでも同じです。短縮 URL が拡散した、バッチが同時刻に走った、ロードバランサの再試行が重なった。こうした短時間の流量増加をすべて内側へ流すと、下流の DB や Redis が先に限界へ達します。
+
+さらに、下流が遅くなるとクライアントがタイムアウトして再試行し、再試行がさらに流量を増やすことがあります。これがカスケード障害です。レートリミットは量を絞り、タイムアウトは待ち続けないようにし、リクエストボディ防御は処理前に入力を小さく厳密にします。どれも、壊れ方を小さくするための設計です。
+
+### token bucket の直感
+
+Day 13 のレートリミットは token bucket です。バケツにトークンが入り、リクエスト 1 件につきトークンを 1 個使う、と考えます。トークンがあれば通す。なければ `429 Too Many Requests` で断る。時間が経つと、一定速度でトークンが補充されます。
+
+`rate` は補充速度です。`RATE_LIMIT_RPS=2` なら、1 秒あたり 2 個のトークンが戻ります。長い目で見ると、通せる流量はだいたい 2 req/s です。
+
+`burst` はバケツの容量です。`RATE_LIMIT_BURST=3` なら、最大 3 個までトークンをためられます。しばらく静かだったクライアントは、最初の 3 件を続けて通せます。ただし 4 件目は、補充が間に合わなければ 429 になります。
+
+```txt title="RATE_LIMIT_RPS=2 RATE_LIMIT_BURST=3 の直感"
+開始時: token = 3
+1件目: token = 2 -> 通す
+2件目: token = 1 -> 通す
+3件目: token = 0 -> 通す
+4件目: token = 0 -> 429
+```
+
+実検証でも、`RATE_LIMIT_RPS=2`、`RATE_LIMIT_BURST=3` では、短時間に連打すると 4 リクエスト目から 429 が返ります。これはバグではなく、今日見たい防御動作です。
+
+### sliding window との比較
+
+レートリミットには sliding window もあります。たとえば「直近 60 秒のリクエスト数が 120 件を超えたら拒否する」という方式です。今この瞬間から過去 60 秒を見るので sliding window と呼びます。
+
+sliding window は「ある期間に何件まで」を説明しやすい方式です。一方で、各クライアントのリクエスト時刻や時間バケットを持つ必要があり、実装と保存量が少し重くなります。
+
+token bucket は「平均はこの速度まで。ただし短い burst は許す」という表現が得意です。API では、ページ読み込みや小さなバッチで数件が一瞬にまとまることがあります。その自然な揺れは通しつつ、長く続く過剰流量を止めるため、今日の実装では token bucket を使っています。
+
+### Day 13 の RateLimiter
+
+実装は `golang.org/x/time/rate` を使います。`RateLimiter` は IP アドレスごとに `rate.Limiter` を持ちます。`RATE_LIMIT_RPS` と `RATE_LIMIT_BURST` が両方設定されたときだけ有効になり、片方だけだと起動時に設定エラーにします。
+
+```go title="app/internal/middleware/ratelimit.go"
+func RateLimitFromEnv() (func(http.Handler) http.Handler, error) {
+	rpsValue := os.Getenv("RATE_LIMIT_RPS")
+	burstValue := os.Getenv("RATE_LIMIT_BURST")
+	if rpsValue == "" && burstValue == "" {
+		return func(next http.Handler) http.Handler { return next }, nil
+	}
+	if rpsValue == "" || burstValue == "" {
+		return nil, errors.New("RATE_LIMIT_RPS and RATE_LIMIT_BURST must be set together")
+	}
+
+	rps, err := strconv.ParseFloat(rpsValue, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse RATE_LIMIT_RPS: %w", err)
+	}
+	burst, err := strconv.Atoi(burstValue)
+	if err != nil {
+		return nil, fmt.Errorf("parse RATE_LIMIT_BURST: %w", err)
+	}
+
+	limiter, err := NewRateLimiter(rps, burst)
+	if err != nil {
+		return nil, err
+	}
+	limiter.trustProxy = os.Getenv("TRUST_PROXY") == "true"
+	return limiter.Middleware, nil
+}
+```
+
+環境変数が未設定なら、教材の前半と同じようにレートリミットなしで動きます。本番では「未設定でも安全側に倒す」設計もありますが、今日は学習用として、明示したときだけ有効にします。
+
+IP ごとの limiter はメモリ上の map に入ります。放置すると、送信元 IP を大量に変える攻撃やスキャンで map が増え続けるため、最後に使った時刻を記録し、古いエントリを定期削除します。さらに上限を 1 万件にして、上限に達したときは最も古いエントリを 1 つ捨てます。教材として読みやすい実装を優先しつつ、無制限にメモリを使わない形にしています。
+
+### 429 とレートリミットヘッダ
+
+トークンがある場合は、下流のハンドラへ進みます。トークンがない場合は、下流へ進まず `429 Too Many Requests` を返します。この時点では URL 作成も DB 保存も行いません。入口で止めることに意味があります。
+
+```go title="app/internal/middleware/ratelimit.go"
+if client.Allow() {
+	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(l.burst))
+	w.Header().Set("X-RateLimit-Remaining", formatRemaining(client.Tokens()))
+	next.ServeHTTP(w, r)
+	return
+}
+
+w.Header().Set("X-RateLimit-Limit", strconv.Itoa(l.burst))
+w.Header().Set("X-RateLimit-Remaining", "0")
+w.Header().Set("Retry-After", retryAfter(client))
+metrics.RecordRateLimited()
+http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+```
+
+`X-RateLimit-Limit` は、この制限の上限を伝えるヘッダです。今日の実装では `burst` の値が入ります。`X-RateLimit-Remaining` は、今すぐ使える残りトークン数の目安です。429 のときは `0` です。
+
+`Retry-After` は、クライアントに「少なくともこの秒数待ってから再試行してほしい」と伝えるヘッダです。429 だけだと素朴なクライアントはすぐ再試行してしまいます。`Retry-After` があれば、礼儀正しいクライアントは待てます。
+
+Day 12 のメトリクスと組み合わせると、もう 1 つ大事な設計判断があります。`http_requests_total` の `route` ラベルを正しく付けるため、Metrics middleware は `ServeMux` を直接ラップしています。つまり、レートリミットで拒否した 429 は mux まで到達せず、`http_requests_total` には入りません。その代わり、429 は専用の `rate_limited_total` カウンタで数えます。
+
+```go title="app/internal/metrics/metrics.go"
+RateLimitedTotal = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "rate_limited_total",
+		Help: "Total number of requests rejected by the rate limiter.",
+	},
+)
+```
+
+### IP 別制限の落とし穴
+
+今日の実装は、クライアント IP ごとに limiter を分けます。ただし、`X-Forwarded-For` は無条件には使いません。`TRUST_PROXY=true` のときだけ、先頭の値が `net/netip` で妥当な IP として parse できた場合に採用します。それ以外は `RemoteAddr` だけを使います。
+
+```go title="app/internal/middleware/ratelimit.go"
+func (l *RateLimiter) clientIP(r *http.Request) string {
+	if forwardedFor := r.Header.Get("X-Forwarded-For"); l.trustProxy && forwardedFor != "" {
+		parts := strings.Split(forwardedFor, ",")
+		if addr, err := netip.ParseAddr(strings.TrimSpace(parts[0])); err == nil {
+			return addr.String()
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.String()
+	}
+	return host
+}
+```
+
+`X-Forwarded-For` は、信頼できるリバースプロキシが上書きしている場合だけ信じられます。インターネットから直接アプリへ届く構成で、クライアントが自由にこのヘッダを付けられるなら、IP 制限を簡単に回避できます。そのため、明示的に `TRUST_PROXY=true` とした構成以外では、偽装しにくい接続元の `RemoteAddr` を使います。
+
+逆の問題もあります。会社、学校、携帯キャリア、家庭用ルータの NAT の背後では、多数の利用者が同じ送信元 IP に見えることがあります。IP 別制限を厳しくしすぎると、1 人の連打で同じ NAT 背後の別ユーザーまで巻き込むかもしれません。
+
+### タイムアウトの階層設計
+
+レートリミットは量を絞ります。タイムアウトは時間を絞ります。Day 13 の `app/cmd/server/main.go` は、`http.Server` に複数のタイムアウトを設定しています。
+
+```go title="app/cmd/server/main.go"
+server := &http.Server{
+	Addr:              addr,
+	ReadHeaderTimeout: 2 * time.Second,
+	ReadTimeout:       10 * time.Second,
+	WriteTimeout:      10 * time.Second,
+	IdleTimeout:       60 * time.Second,
+	Handler:           h,
+}
+```
+
+`ReadHeaderTimeout` は、ヘッダを少しずつ送って接続を占有する slowloris 型の攻撃に効きます。`ReadTimeout` はヘッダとボディの読み取り全体、`WriteTimeout` はレスポンスを書き切るまで、`IdleTimeout` は keep-alive 接続をいつまで待つかです。
+
+HTTP サーバの外側だけでは足りません。アプリ内の処理にも、リクエスト単位の `context` timeout を渡します。Day 13 では既定 5 秒で、`REQUEST_TIMEOUT` によって変更できます。
+
+```go title="app/internal/middleware/timeout.go"
+func RequestTimeout(timeout time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), timeout)
+			defer cancel()
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+```
+
+基本方針は、内側ほど短くです。今回なら、リクエスト context は既定 5 秒、`WriteTimeout` は 10 秒です。内側の context が先に切れれば、storage や Redis 呼び出しはキャンセルを観測できます。外側の WriteTimeout が先に切れると、アプリはまだ処理しているのにクライアントへの書き込みだけが失敗し、原因が追いにくくなります。
+
+Redis クライアントにも `DialTimeout`、`ReadTimeout`、`WriteTimeout` が 200ms で設定されています。Redis はキャッシュです。Redis が遅いせいで DB から直接読めるリクエストまで何秒も待つのは本末転倒なので、短くあきらめて次の手段へ進む余地を残します。
+
+### Redis のリトライと指数バックオフ
+
+Redis クライアントは、短い timeout に加えてリトライ回数とバックオフも明示しています。
+
+```go title="app/cmd/server/main.go"
+client := redis.NewClient(&redis.Options{
+	Addr:            redisAddr,
+	DialTimeout:     200 * time.Millisecond,
+	ReadTimeout:     200 * time.Millisecond,
+	WriteTimeout:    200 * time.Millisecond,
+	MaxRetries:      2,
+	MinRetryBackoff: 50 * time.Millisecond,
+	MaxRetryBackoff: 200 * time.Millisecond,
+})
+```
+
+ここで大事なのは、リトライを増やせば安全になるわけではない、という点です。`REQUEST_TIMEOUT` の既定は 5 秒ですが、Redis は補助的なキャッシュなので、数秒を Redis だけに使うべきではありません。200ms の操作 timeout と最大 2 回の短い指数バックオフなら、Redis が一時的に揺れたときは少しだけ再試行し、それでもだめなら DB へのフォールバックに進めます。内側ほど短く、リトライ込みでも外側の予算に収める、というのが今日の設計です。
+
+### DB クエリの per-call timeout
+
+SQLite と PostgreSQL の各クエリにも、リクエスト context を親にした 2 秒の per-call timeout を付けています。
+
+```go title="app/internal/storage/postgres.go"
+queryCtx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+defer cancel()
+tag, err := s.pool.Exec(queryCtx, query, code, url)
+```
+
+```go title="app/internal/storage/sqlite.go"
+queryCtx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+defer cancel()
+result, err := s.db.ExecContext(queryCtx, query, code, url)
+```
+
+親は HTTP リクエストの context なので、クライアント切断や `REQUEST_TIMEOUT` のキャンセルも storage 層へ伝わります。その内側に 2 秒のクエリ timeout を置くことで、DB 呼び出し 1 回がリクエスト全体の 5 秒を使い切る状態を避けます。複数の下流呼び出しを組み合わせるサービスほど、この per-call の上限が重要になります。
+
+### リクエストボディを守る
+
+入口の守りは、リクエスト数だけではありません。1 件のリクエストが大きすぎたり、想定外の JSON を含んでいたり、正常な JSON の後ろに余計なデータを持っていたりする場合もあります。Day 13 の `POST /api/links` は、ボディを小さく、厳密に読みます。
+
+```go title="app/internal/handler/handler.go"
+func decodeCreateLinkRequest(w http.ResponseWriter, r *http.Request) (createLinkRequest, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, createLinkMaxBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	var req createLinkRequest
+	if err := decoder.Decode(&req); err != nil {
+		return createLinkRequest{}, err
+	}
+	var trailing struct{}
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return createLinkRequest{}, errors.New("invalid trailing json")
+	}
+	return req, nil
+}
+```
+
+`http.MaxBytesReader` は、巨大な body でメモリや CPU を使い切らないための上限です。`createLinkMaxBodyBytes` は 64 KiB です。URL を 1 つ送る API としては十分大きく、異常な入力は早めに止められます。
+
+`DisallowUnknownFields` は、JSON に知らないフィールドがあるとエラーにします。`{"url":"https://example.com","owner":"alice"}` のような入力を黙って受けると、クライアントは `owner` が保存されたと誤解するかもしれません。
+
+最後の `decoder.Decode(&trailing)` は、末尾ゴミを検出します。`{"url":"https://example.com"} trailing` のように、先頭だけ正常な JSON で後ろに余計な文字がある入力を拒否します。実検証では、過大ボディは `413 Request Entity Too Large`、未知フィールドと末尾ゴミは `400 Bad Request`、正常な作成は `201 Created` として観察します。
+
+### graceful degradation の復習
+
+Day 8 で Redis cache-aside を入れたとき、Redis が落ちても保存先へフォールバックする設計にしました。これが graceful degradation です。全部を成功させるのではなく、補助的な機能が壊れても、中心機能だけはできるだけ返す設計です。
+
+```go title="app/internal/cache/redis.go"
+if url, err := s.client.Get(ctx, key); err == nil {
+	s.hits.Add(1)
+	metrics.RecordCacheHit()
+	return url, nil
+} else {
+	s.misses.Add(1)
+	metrics.RecordCacheMiss()
+	if !errors.Is(err, redis.Nil) {
+		slog.Warn("redis get failed; falling back to storage", "code", code, "error", err)
+	}
+}
+
+url, err := s.next.Load(ctx, code)
+```
+
+Redis が読めなければログを出し、DB へ直行します。キャッシュヒット率やレイテンシは悪化しますが、DB が生きていればリダイレクトは返せます。Day 13 の短い Redis timeout は、この設計とつながっています。
+
+### サーキットブレーカーの概念
+
+今日はサーキットブレーカーを実装しません。ただし、回復性の設計ではよく出てくる概念なので、名前だけ押さえておきます。
+
+サーキットブレーカーは、下流サービスの失敗が続いたときに、しばらく呼び出しを止める仕組みです。一定時間後に少量だけ試し、成功すれば戻し、失敗すればまた止めます。
+
+レートリミットは主に入口の流量を守ります。タイムアウトは待ち時間を守ります。サーキットブレーカーは、壊れている下流へ呼び続けないことで、障害の増幅を防ぎます。この 3 つは、互いに置き換えるものではなく、層として組み合わせるものです。
+
+## 手を動かす
+
+まず、レートリミットを有効にしてアプリを起動します。サーバは `app` ディレクトリで起動します。
+
+```bash title="ターミナル1: アプリを起動"
+cd app
+RATE_LIMIT_RPS=2 RATE_LIMIT_BURST=3 REQUEST_TIMEOUT=5s go run ./cmd/server
+```
+
+起動ログは JSON で出ます。
+
+```json title="期待出力例"
+{"time":"...","level":"INFO","msg":"shortlink server listening","addr":":8080"}
+```
+
+別ターミナルから、短時間に 5 回作成リクエストを送ります。
+
+```bash title="ターミナル2: 連打して 429 を見る"
+for i in 1 2 3 4 5; do
+  echo "--- request $i"
+  curl -s -i \
+    -H 'Content-Type: application/json' \
+    -d "{\"url\":\"https://example.com/day13/$i\"}" \
+    http://localhost:8080/api/links | sed -n '1,12p'
+done
+```
+
+最初の 3 件は 201 になり、4 件目以降で 429 が見えます。タイミングによって補充が入ることはありますが、連打すれば token bucket の `burst=3` を超える様子を確認できます。
+
+```txt title="期待出力例"
+--- request 1
+HTTP/1.1 201 Created
+X-Ratelimit-Limit: 3
+X-Ratelimit-Remaining: 2
+
+--- request 4
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+X-Ratelimit-Limit: 3
+X-Ratelimit-Remaining: 0
+```
+
+Go の `http.Header` は表示時にヘッダ名を canonicalize するため、curl では `X-Ratelimit-Limit` のように見えることがあります。意味としてはコード内の `X-RateLimit-Limit` と同じです。
+
+次に、不正なリクエストボディを確認します。未知フィールドと末尾ゴミは 400、上限を超えるボディは 413 です。
+
+```bash title="未知フィールドと末尾ゴミを確認"
+curl -s -i \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","owner":"alice"}' \
+  http://localhost:8080/api/links | sed -n '1,8p'
+
+curl -s -i \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com"} trailing' \
+  http://localhost:8080/api/links | sed -n '1,8p'
+```
+
+```bash title="過大ボディを確認"
+python3 - <<'PY' | curl -s -i \
+  -H 'Content-Type: application/json' \
+  --data-binary @- \
+  http://localhost:8080/api/links | sed -n '1,8p'
+print('{"url":"https://example.com/' + 'a' * 70000 + '"}')
+PY
+```
+
+期待する観察は、API 契約外の入力が作成処理へ進まないことです。未知フィールドと末尾ゴミは JSON 契約違反なので 400、読み取り上限を超えた body は 413 で止まります。正常な body では 201 が返ります。
+
+```txt title="期待出力例"
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+
+{"error":"invalid json"}
+
+HTTP/1.1 413 Request Entity Too Large
+Content-Type: application/json
+
+{"error":"request body too large"}
+
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"code":"...","short_url":"http://localhost:8080/..."}
+```
+
+最後に k6 で、意図的に制限を超える負荷を流します。サーバは `RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20` くらいで起動し直します。
+
+```bash title="ターミナル1: k6 用に起動し直す"
+cd app
+RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20 go run ./cmd/server
+```
+
+リポジトリルートから k6 を実行します。
+
+```bash title="ターミナル2: k6 で 429 割合を見る"
+BASE_URL=http://localhost:8080 RATE=80 k6 run load/day13-ratelimit.js
+```
+
+`load/day13-ratelimit.js` は `constant-arrival-rate` で `POST /api/links` を送り続けます。429 は期待される防御動作なので、`http.setResponseCallback` で失敗扱いから外しています。
+
+```js title="load/day13-ratelimit.js"
+http.setResponseCallback(http.expectedStatuses({ min: 200, max: 399 }, 429));
+export const rateLimited = new Rate('rate_limited');
+```
+
+出力では `rate_limited` を見ます。`RATE=80` に対してサーバ側は `RATE_LIMIT_RPS=10` なので、かなりの割合が 429 になるはずです。同時に `http_req_duration p(95)` が低い値に収まっているか、429 以外の失敗が増えていないかも確認します。
+
+```txt title="期待出力例"
+checks.........................: 100.00% ✓ ...
+http_req_failed................: 0.00%
+http_req_duration..............: avg=... p(95)<250ms
+rate_limited...................: 80% 前後
+```
+
+Prometheus を見ている場合は、通常のリクエストが `route="redirect"` や `route="/api/links"` として増え、レートリミット拒否が `rate_limited_total` として増えることを確認できます。429 は mux まで到達しないため、`http_requests_total` ではなく専用カウンタで見る設計です。
+
+```promql title="通常リクエストの route ラベルを確認"
+sum(rate(http_requests_total[1m])) by (route, status)
+```
+
+```promql title="429 を専用カウンタで確認"
+rate(rate_limited_total[1m])
+```
+
+## クイズ
+
+<Quiz question="token bucket の burst の説明として最も近いものはどれですか？" choices={['短時間にためておけるトークンの最大数で、瞬間的に通せる余裕を表す', '1 秒あたりに必ず拒否するリクエスト数を表す', 'HTTP レスポンスの最大ボディサイズを表す', 'Redis へ接続する最大回数を表す']} answer={0} explanation="burst はバケツの容量です。静かな時間にたまったトークンによって、短い連続リクエストを一定数まで通せます。" />
+
+<Quiz question="429 応答の Retry-After ヘッダは何を伝えますか？" choices={['クライアントが次の再試行まで待つべき秒数の目安', 'サーバが起動してからの経過秒数', '短縮 URL の有効期限', 'Prometheus が次に scrape する時刻']} answer={0} explanation="Retry-After は、すぐ再試行せず少なくともこの程度待ってほしい、というサーバからクライアントへの合図です。" />
+
+<Quiz question="タイムアウトを内側ほど短くする理由として適切なものはどれですか？" choices={['内側の処理が先にキャンセルを観測でき、外側の接続 timeout だけで突然切れる状態を減らせるから', 'すべてのリクエストを必ず速く成功させられるから', 'ReadHeaderTimeout を 0 にできるから', 'Redis のデータを永続化できるから']} answer={0} explanation="リクエスト context や Redis timeout が先に切れると、アプリはキャンセルを観測してフォールバックやエラー処理へ進めます。" />
+
+<Quiz question="http.MaxBytesReader が主に守っているものはどれですか？" choices={['巨大なリクエストボディによるメモリ、CPU、読み取り時間の消費', '短縮コードの重複', 'Prometheus のラベル数', 'Redis の TTL']} answer={0} explanation="MaxBytesReader は body の読み取り上限を作ります。URL 1 つの API に不要な巨大入力を、処理の奥へ進めないための防御です。" />
+
+<Quiz question="token bucket と sliding window の比較として正しいものはどれですか？" choices={['token bucket は平均速度と短い burst を表しやすく、sliding window は直近期間の件数上限を表しやすい', 'token bucket は必ず DB を使い、sliding window はメモリだけでしか実装できない', 'token bucket は 429 を返せず、sliding window だけが 429 を返せる', 'どちらもタイムアウトの代わりなので、ReadTimeout は不要になる']} answer={0} explanation="token bucket は補充速度と容量で制限を表します。sliding window は直近 N 秒に何件まで、という制限を表しやすい方式です。" />
+
+## 今日のまとめ
+
+今日は、サービスの入口を守る設計を見ました。レートリミットは、暴走クライアントやスパイクを下流へそのまま流さないための仕組みです。Day 13 の実装では、IP ごとの token bucket を作り、`RATE_LIMIT_RPS` を補充速度、`RATE_LIMIT_BURST` を短い余裕として扱います。
+
+トークンがなくなったリクエストには `429 Too Many Requests` を返します。`Retry-After` は再試行までの待ち時間、`X-RateLimit-Limit` と `X-RateLimit-Remaining` は制限と残りの目安です。通常の HTTP メトリクスは mux の route 情報を使い、429 は mux の手前で止まるため `rate_limited_total` で観察します。
+
+タイムアウトは階層で考えます。`http.Server` の `ReadHeaderTimeout`、`ReadTimeout`、`WriteTimeout`、`IdleTimeout` で接続の外側を守り、リクエスト `context` でアプリ処理を守り、Redis/DB 呼び出しにはさらに短い待ち時間を持たせます。内側ほど短くして、下流の遅さを上流全体へ広げないことが大事です。
+
+リクエストボディも入口の一部です。`MaxBytesReader` でサイズを絞り、過大ボディは 413 で拒否します。`DisallowUnknownFields` で API 契約外のフィールドを拒否し、末尾ゴミを検出した場合は 400 です。「処理してから困る」のではなく、「処理する前に拒否する」設計です。
+
+Day 8 の Redis フォールバックも、今日の回復性の話につながりました。Redis が落ちても DB へ直行して中心機能を返す。そのために Redis timeout を短くし、ログとメトリクスで状態を見ます。サーキットブレーカーは未実装ですが、壊れている下流へ呼び続けないための次の防御として覚えておきましょう。
+
+## 明日の予告
+
+明日は、分散の理論へ進みます。テーマはシャーディングと consistent hashing です。データやリクエストを複数ノードへ分けるとき、単純な modulo では何が困るのか。ノード追加や削除で移動するキーをどう減らすのか。Day 11 の水平スケール、Day 13 の入口防御に続いて、「分けて持つ」ための考え方を学びます。

@@ -27,6 +27,13 @@ var (
 		[]string{"route"},
 	)
 
+	RateLimitedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "rate_limited_total",
+			Help: "Total number of requests rejected by the rate limiter.",
+		},
+	)
+
 	CacheHitsTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "cache_hits_total",
@@ -45,6 +52,10 @@ var (
 func RecordHTTPRequest(method, route string, status int, duration time.Duration) {
 	HTTPRequestsTotal.WithLabelValues(method, route, strconv.Itoa(status)).Inc()
 	HTTPRequestDurationSeconds.WithLabelValues(route).Observe(duration.Seconds())
+}
+
+func RecordRateLimited() {
+	RateLimitedTotal.Inc()
 }
 
 func RecordCacheHit() {

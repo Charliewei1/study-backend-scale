@@ -44,15 +44,38 @@ func main() {
 
 	baseURL := fmt.Sprintf("http://localhost:%s", port)
 	appHandler := handler.New(shortener.New(), store, baseURL, clicks, cacheStats)
+	requestTimeout, err := middleware.RequestTimeoutFromEnv()
+	if err != nil {
+		fatal("configure request timeout", "error", err)
+	}
+	rateLimit, err := middleware.RateLimitFromEnv()
+	if err != nil {
+		fatal("configure rate limit", "error", err)
+	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.Handler())
 	mux.Handle("/", appHandler)
-	h := middleware.RequestLogger(logger)(middleware.Metrics(mux))
+	h := middleware.RequestLogger(logger)(
+		middleware.RequestTimeout(requestTimeout)(
+			rateLimit(
+				middleware.Metrics(mux),
+			),
+		),
+	)
 
 	addr := ":" + port
 	server := &http.Server{
-		Addr:    addr,
-		Handler: h,
+		Addr: addr,
+		// ReadHeaderTimeout limits slowloris-style header trickles. ReadTimeout is
+		// still longer because clients may need to send a small JSON body. WriteTimeout
+		// is longer than REQUEST_TIMEOUT (default 5s), so the inner request context
+		// expires first and storage/Redis calls can observe cancellation. IdleTimeout
+		// keeps keep-alive connections useful without leaving them open indefinitely.
+		ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		Handler:           h,
 	}
 	debugServer := newDebugServer()
 
@@ -124,11 +147,17 @@ func withRedisCache(store storage.Storage) (storage.Storage, func(), cache.Stats
 		return store, func() {}, nil
 	}
 
+	// Redis is a cache, so its per-operation deadlines stay well inside the
+	// request timeout. Even with two short backoff retries, Redis cannot consume
+	// the whole request budget before the storage fallback has a chance to run.
 	client := redis.NewClient(&redis.Options{
-		Addr:         redisAddr,
-		DialTimeout:  200 * time.Millisecond,
-		ReadTimeout:  200 * time.Millisecond,
-		WriteTimeout: 200 * time.Millisecond,
+		Addr:            redisAddr,
+		DialTimeout:     200 * time.Millisecond,
+		ReadTimeout:     200 * time.Millisecond,
+		WriteTimeout:    200 * time.Millisecond,
+		MaxRetries:      2,
+		MinRetryBackoff: 50 * time.Millisecond,
+		MaxRetryBackoff: 200 * time.Millisecond,
 	})
 	cached := cache.NewRedisStore(store, client)
 	slog.Info("redis cache enabled", "addr", redisAddr)
@@ -155,6 +184,9 @@ func newDebugServer() *http.Server {
 
 	return &http.Server{
 		Addr: addr,
+		// The debug server has no request body, so only the header deadline is needed
+		// to avoid slowloris-style connections when pprof is enabled.
+		ReadHeaderTimeout: 2 * time.Second,
 		// pprof は内部状態を見せるため、本番 API と同じポートではなく
 		// DEBUG_ADDR の別ポートで明示的に有効化したときだけ公開する。
 		Handler: mux,

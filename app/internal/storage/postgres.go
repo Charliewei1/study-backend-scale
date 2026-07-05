@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const postgresQueryTimeout = 2 * time.Second
 
 // PostgresStore は PostgreSQL を使う永続化ストアです。
 type PostgresStore struct {
@@ -38,7 +41,9 @@ CREATE TABLE IF NOT EXISTS links (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );`
 
-	if _, err := s.pool.Exec(ctx, schema); err != nil {
+	queryCtx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+	if _, err := s.pool.Exec(queryCtx, schema); err != nil {
 		return fmt.Errorf("initialize postgres schema: %w", err)
 	}
 	return nil
@@ -51,7 +56,9 @@ func (s *PostgresStore) Close() {
 
 // Ping は PostgreSQL 接続プールから DB へ疎通できるかを確認します。
 func (s *PostgresStore) Ping(ctx context.Context) error {
-	if err := s.pool.Ping(ctx); err != nil {
+	queryCtx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+	if err := s.pool.Ping(queryCtx); err != nil {
 		return fmt.Errorf("ping postgres: %w", err)
 	}
 	return nil
@@ -64,7 +71,9 @@ INSERT INTO links (code, url)
 VALUES ($1, $2)
 ON CONFLICT (code) DO NOTHING;`
 
-	tag, err := s.pool.Exec(ctx, query, code, url)
+	queryCtx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+	tag, err := s.pool.Exec(queryCtx, query, code, url)
 	if err != nil {
 		return fmt.Errorf("save link: %w", err)
 	}
@@ -87,8 +96,10 @@ func (s *PostgresStore) Load(ctx context.Context, code string) (string, error) {
 func (s *PostgresStore) Get(ctx context.Context, code string) (Link, error) {
 	const query = `SELECT code, url, clicks FROM links WHERE code = $1;`
 
+	queryCtx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
 	var link Link
-	if err := s.pool.QueryRow(ctx, query, code).Scan(&link.Code, &link.URL, &link.Clicks); err != nil {
+	if err := s.pool.QueryRow(queryCtx, query, code).Scan(&link.Code, &link.URL, &link.Clicks); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Link{}, ErrNotFound
 		}
@@ -101,7 +112,9 @@ func (s *PostgresStore) Get(ctx context.Context, code string) (Link, error) {
 func (s *PostgresStore) IncrementClicks(ctx context.Context, code string) error {
 	const query = `UPDATE links SET clicks = clicks + 1 WHERE code = $1;`
 
-	tag, err := s.pool.Exec(ctx, query, code)
+	queryCtx, cancel := context.WithTimeout(ctx, postgresQueryTimeout)
+	defer cancel()
+	tag, err := s.pool.Exec(queryCtx, query, code)
 	if err != nil {
 		return fmt.Errorf("increment clicks: %w", err)
 	}

@@ -4,6 +4,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,6 +15,7 @@ import (
 )
 
 const createLinkMaxAttempts = 5
+const createLinkMaxBodyBytes = 64 * 1024
 
 // Handler は URL 短縮 API の依存関係をまとめた型です。
 type Handler struct {
@@ -106,8 +108,13 @@ func (h *Handler) getCacheStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
-	var req createLinkRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	req, err := decodeCreateLinkRequest(w, r)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
 		writeJSONError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
@@ -148,6 +155,25 @@ func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONError(w, http.StatusInternalServerError, "internal server error")
+}
+
+func decodeCreateLinkRequest(w http.ResponseWriter, r *http.Request) (createLinkRequest, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, createLinkMaxBodyBytes)
+
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	var req createLinkRequest
+	if err := decoder.Decode(&req); err != nil {
+		return createLinkRequest{}, err
+	}
+
+	var trailing struct{}
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return createLinkRequest{}, errors.New("invalid trailing json")
+	}
+
+	return req, nil
 }
 
 func (h *Handler) getLink(w http.ResponseWriter, r *http.Request) {

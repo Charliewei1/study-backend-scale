@@ -5,9 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+const sqliteQueryTimeout = 2 * time.Second
 
 // SQLiteStore は SQLite ファイルを使う永続化ストアです。
 type SQLiteStore struct {
@@ -38,7 +41,9 @@ CREATE TABLE IF NOT EXISTS links (
 	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );`
 
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+	queryCtx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+	if _, err := s.db.ExecContext(queryCtx, schema); err != nil {
 		return fmt.Errorf("initialize sqlite schema: %w", err)
 	}
 	if err := s.ensureClicksColumn(ctx); err != nil {
@@ -48,7 +53,10 @@ CREATE TABLE IF NOT EXISTS links (
 }
 
 func (s *SQLiteStore) ensureClicksColumn(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(links);`)
+	queryCtx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+
+	rows, err := s.db.QueryContext(queryCtx, `PRAGMA table_info(links);`)
 	if err != nil {
 		return fmt.Errorf("inspect sqlite schema: %w", err)
 	}
@@ -71,7 +79,9 @@ func (s *SQLiteStore) ensureClicksColumn(ctx context.Context) error {
 	}
 
 	const alter = `ALTER TABLE links ADD COLUMN clicks INTEGER NOT NULL DEFAULT 0;`
-	if _, err := s.db.ExecContext(ctx, alter); err != nil {
+	alterCtx, alterCancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer alterCancel()
+	if _, err := s.db.ExecContext(alterCtx, alter); err != nil {
 		return fmt.Errorf("add clicks column: %w", err)
 	}
 	return nil
@@ -84,7 +94,9 @@ func (s *SQLiteStore) Close() error {
 
 // Ping は SQLite 接続が利用可能かを確認します。
 func (s *SQLiteStore) Ping(ctx context.Context) error {
-	if err := s.db.PingContext(ctx); err != nil {
+	queryCtx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+	if err := s.db.PingContext(queryCtx); err != nil {
 		return fmt.Errorf("ping sqlite: %w", err)
 	}
 	return nil
@@ -97,7 +109,9 @@ INSERT INTO links (code, url)
 VALUES (?, ?)
 ON CONFLICT(code) DO NOTHING;`
 
-	result, err := s.db.ExecContext(ctx, query, code, url)
+	queryCtx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+	result, err := s.db.ExecContext(queryCtx, query, code, url)
 	if err != nil {
 		return fmt.Errorf("save link: %w", err)
 	}
@@ -124,8 +138,10 @@ func (s *SQLiteStore) Load(ctx context.Context, code string) (string, error) {
 func (s *SQLiteStore) Get(ctx context.Context, code string) (Link, error) {
 	const query = `SELECT code, url, clicks FROM links WHERE code = ?;`
 
+	queryCtx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
 	var link Link
-	if err := s.db.QueryRowContext(ctx, query, code).Scan(&link.Code, &link.URL, &link.Clicks); err != nil {
+	if err := s.db.QueryRowContext(queryCtx, query, code).Scan(&link.Code, &link.URL, &link.Clicks); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Link{}, ErrNotFound
 		}
@@ -138,7 +154,9 @@ func (s *SQLiteStore) Get(ctx context.Context, code string) (Link, error) {
 func (s *SQLiteStore) IncrementClicks(ctx context.Context, code string) error {
 	const query = `UPDATE links SET clicks = clicks + 1 WHERE code = ?;`
 
-	result, err := s.db.ExecContext(ctx, query, code)
+	queryCtx, cancel := context.WithTimeout(ctx, sqliteQueryTimeout)
+	defer cancel()
+	result, err := s.db.ExecContext(queryCtx, query, code)
 	if err != nil {
 		return fmt.Errorf("increment clicks: %w", err)
 	}
