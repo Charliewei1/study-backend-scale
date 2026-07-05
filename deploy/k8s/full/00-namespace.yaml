@@ -1,0 +1,11 @@
+# Namespace は Kubernetes クラスタ内のリソースを論理的に分ける単位です。
+# full は base とは独立して適用できるよう、専用の Namespace を使います。
+apiVersion: v1
+kind: Namespace
+metadata:
+  # base の shortlink Namespace と衝突しない名前にします。
+  name: shortlink-full
+  labels:
+    app.kubernetes.io/name: shortlink
+    app.kubernetes.io/instance: shortlink-full
+    app.kubernetes.io/part-of: study-backend-scale

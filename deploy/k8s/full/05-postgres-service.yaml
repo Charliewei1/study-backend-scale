@@ -1,0 +1,22 @@
+# Service はアプリ Pod から PostgreSQL Pod へ安定した DNS 名を提供します。
+# shortlink-full Namespace 内では postgres:5432 で接続できます。
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: shortlink-full
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/instance: shortlink-full
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: study-backend-scale
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/instance: shortlink-full
+  ports:
+    - name: postgres
+      port: 5432
+      # targetPort は Deployment の ports.name: postgres を参照します。
+      targetPort: postgres

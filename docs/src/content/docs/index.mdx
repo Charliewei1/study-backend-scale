@@ -21,12 +21,12 @@ sidebar:
 | Day 5 | Docker でコンテナ化 | multi-stage build、distroless、イメージレイヤ、非 root 実行 |
 | Day 6 | Docker Compose と Postgres 移行 | Compose、Postgres、healthcheck、サービス名 DNS、接続プール |
 | Day 7 | 計測: k6 ベースラインと pprof | レイテンシ、スループット、p95、k6、pprof |
-| Day 8 | Redis キャッシュで読みを速くする | read-heavy ワークロード、cache-aside、TTL、キャッシュヒット率 |
+| Day 8 | Redis キャッシュ: 読み取りを速くする | read-heavy ワークロード、cache-aside、TTL、キャッシュヒット率 |
 | Day 9 | Kubernetes 入門: kind で動かす | Pod、Deployment、ReplicaSet、Service、kubectl の基本 |
 | Day 10 | k8s 設定・ヘルスチェック・ローリング更新 | ConfigMap、Secret、probe、resources、RollingUpdate |
 | Day 11 | 水平スケールと HPA | ステートレス化、ランダム ID、衝突確率、Horizontal Pod Autoscaler |
 | Day 12 | 可観測性: Prometheus と structured logging | メトリクス、ログ、RED メソッド、PromQL、JSON ログ |
-| Day 13 | レートリミットと回復性 | token bucket、429、タイムアウト、バックオフ、graceful degradation |
+| Day 13 | レートリミットと回復性: 入口で守る | token bucket、429、タイムアウト、バックオフ、graceful degradation |
 | Day 14 | さらなるスケール: シャーディングと分散の理論 | リードレプリカ、シャーディング、consistent hashing、CAP 定理 |
 | Day 15 | 総仕上げ: フルスタックデプロイと最終計測 | 全体アーキテクチャ、最終 k6、改善比較、次の学習ロードマップ |
 
@@ -50,5 +50,6 @@ Go、Docker、Kubernetes の経験が浅くても進められる構成にしま�
 3. 手順どおりにコマンドを実行し、期待出力と違う場合はログを読む。
 4. クイズに答え、間違えた問題は本文とコードに戻って確認する。
 5. Day 7 以降は計測値を記録し、改善前後の数字を比較する。
+6. 各Dayのコードは git タグ(day01〜day15)で参照できる。
 
 このコースの軸は「動いた」で終わらせないことです。URL 短縮という小さな題材でも、読み取りが多い、短い ID が必要、リダイレクトが遅いと体験が悪い、複数レプリカでローカル状態が壊れる、という現実的な制約が出てきます。その制約に対して、コード、インフラ、計測のどこで対応するのかを毎日少しずつ増やしていきます。

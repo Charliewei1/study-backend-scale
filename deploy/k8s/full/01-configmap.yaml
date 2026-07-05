@@ -1,0 +1,25 @@
+# ConfigMap は機密ではない設定値を Pod に渡すためのリソースです。
+# full では app、Postgres、Redis をまとめて動かすため、アプリを postgres 保存と Redis キャッシュに切り替えます。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shortlink-config
+  namespace: shortlink-full
+  labels:
+    app.kubernetes.io/name: shortlink
+    app.kubernetes.io/instance: shortlink-full
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: study-backend-scale
+data:
+  # アプリが listen するポートです。Deployment の containerPort/probe と合わせます。
+  PORT: "8080"
+  # full は最終構成なので、プロセス内 memory ではなく PostgreSQL に保存します。
+  STORAGE: postgres
+  # sqlite に戻す場合の例です。postgres では使われません。
+  SQLITE_PATH: /data/shortlink.db
+  # Redis Service の DNS 名です。同じ Namespace 内なので redis:6379 で解決できます。
+  REDIS_ADDR: redis:6379
+  # 教材では JSON ログを標準出力に出し、通常は info レベルで観察します。
+  LOG_LEVEL: info
+  # 1 リクエストのアプリ内タイムアウトです。Redis の短い timeout と合わせて下流依存で詰まらないようにします。
+  REQUEST_TIMEOUT: 5s

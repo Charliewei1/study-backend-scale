@@ -1,0 +1,62 @@
+# 教材用の素朴な Redis Deployment です。
+# Redis はキャッシュとして使うため永続化せず、appendonly も無効にします。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: shortlink-full
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/instance: shortlink-full
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: study-backend-scale
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+      app.kubernetes.io/instance: shortlink-full
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/instance: shortlink-full
+        app.kubernetes.io/component: cache
+        app.kubernetes.io/part-of: study-backend-scale
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          # 教材用キャッシュなので AOF を有効にせず、Pod 再作成時に失われてもよいデータとして扱います。
+          command:
+            - redis-server
+            - --appendonly
+            - "no"
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 128Mi

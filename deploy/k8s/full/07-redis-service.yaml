@@ -1,0 +1,21 @@
+# Service はアプリ Pod から Redis Pod へ安定した DNS 名を提供します。
+# shortlink-full Namespace 内では redis:6379 で接続できます。
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: shortlink-full
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/instance: shortlink-full
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: study-backend-scale
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/instance: shortlink-full
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

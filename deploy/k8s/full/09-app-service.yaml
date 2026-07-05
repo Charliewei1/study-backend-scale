@@ -1,0 +1,21 @@
+# Service は Pod の入れ替わりに左右されない安定した宛先を作ります。
+apiVersion: v1
+kind: Service
+metadata:
+  name: shortlink
+  namespace: shortlink-full
+  labels:
+    app.kubernetes.io/name: shortlink
+    app.kubernetes.io/instance: shortlink-full
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: study-backend-scale
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: shortlink
+    app.kubernetes.io/instance: shortlink-full
+  ports:
+    - name: http
+      port: 80
+      # targetPort は Deployment の ports.name: http を参照します。
+      targetPort: http
