@@ -1,0 +1,386 @@
+---
+title: Day 2 - API 設計とテスト文化
+description: JSON エラー、URL バリデーション、201 Created と Location ヘッダ、httptest を使った table-driven テストを通じて、API の契約をコードで守る方法を学びます。
+sidebar:
+  label: Day 2
+  order: 2
+---
+
+import Quiz from '../../components/Quiz.astro';
+
+## 今日のゴール
+
+- REST API のステータスコードを、成功と失敗の意味に合わせて使い分ける。
+- `201 Created` と `Location` ヘッダが、作成 API でなぜ大事か説明できるようになる。
+- エラーレスポンスを `{"error":"..."}` に統一する価値を理解する。
+- `net/url.Parse` とスキーム検査による URL バリデーションを読めるようになる。
+- Go の table-driven テストと `t.Run` の書き方に慣れる。
+- `httptest.NewRequest` と `httptest.NewRecorder` でハンドラをテストする流れを理解する。
+- `go test -cover` の出力を見て、カバレッジの意味を説明できるようになる。
+
+## 解説
+
+Day 1 では、最小の URL 短縮サーバを動かしました。
+`POST /api/links` で短縮 URL を作り、`GET /{code}` で元 URL へリダイレクトしました。
+Day 2 では、このサーバを「API として使いやすい形」に整えます。
+
+API は、人間が目で見るだけではなく、他のプログラムから呼ばれます。
+そのため、成功したときの形、失敗したときの形、どの入力を受け付けるかを明確にしておく必要があります。
+今日の実装では、ハンドラに URL バリデーションを追加し、エラーを JSON に統一し、テストでその契約を固定しています。
+
+```txt title="Day 2 で見る主な変更"
+POST /api/links
+  成功時は 201 Created
+  Location ヘッダに短縮 URL
+  エラーは {"error":"..."} に統一
+  URL は http / https のみ許可
+
+GET /api/links/{code}
+  短縮コードのメタ情報を JSON で返す
+
+internal/handler/handler_test.go
+  httptest を使った table-driven テストを追加
+
+Makefile
+  make run / make test / make vet / make fmt を追加
+```
+
+### REST API は「約束」を設計する
+
+REST API では、URL、HTTP メソッド、ステータスコード、ヘッダ、レスポンスボディを組み合わせて意味を表します。
+Day 2 の API は次のように読めます。
+
+```txt title="shortlink の API 契約"
+POST /api/links
+  新しい短縮リンクを作成する
+
+GET /api/links/{code}
+  短縮リンクのメタ情報を取得する
+
+GET /{code}
+  元 URL へリダイレクトする
+
+GET /healthz
+  サーバが生きているか確認する
+```
+
+`POST` は作成、`GET` は取得、という意味に揃えています。
+HTTP メソッドの意味に合わせると、クライアント、プロキシ、ログ、監視ツールが読みやすくなります。
+
+ステータスコードも、レスポンス本文を読まなくても結果を大まかに判定するための共通語です。
+
+```txt title="Day 2 で使う主なステータスコード"
+200 OK           取得やヘルスチェックが成功した
+201 Created      新しいリソースを作成した
+302 Found        別の URL へ移動してほしい
+400 Bad Request  リクエスト内容が不正だった
+404 Not Found    指定された短縮コードが見つからなかった
+```
+
+`POST /api/links` は短縮リンクという新しいリソースを作る API です。
+そのため、成功時は `200 OK` ではなく `201 Created` を返します。
+`200` でも JSON は返せますが、「作成された」という意味までは表せません。
+
+### 201 Created と Location ヘッダ
+
+Day 2 の `createLink` は、成功時に `Location` ヘッダを設定します。
+ここには、作成された短縮 URL が入ります。
+
+```go title="app/internal/handler/handler.go"
+if err := validateURL(req.URL); err != nil {
+	writeJSONError(w, http.StatusBadRequest, err.Error())
+	return
+}
+code := h.shortener.Next()
+h.store.Save(code, req.URL)
+shortURL := h.shortURL(code)
+w.Header().Set("Location", shortURL)
+w.WriteHeader(http.StatusCreated)
+```
+
+レスポンスボディにも `short_url` は入っています。
+それでも `Location` ヘッダを付けるのは、HTTP の慣習として「作成されたリソースの場所」を示せるからです。
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: http://localhost:8080/1
+
+{"code":"1","short_url":"http://localhost:8080/1"}
+```
+
+`201 Created` と `Location` は、「作りました。作ったものはここです」という意味のセットです。
+
+### エラーレスポンスを統一する
+
+Day 1 では、エラーに `http.Error` を使っていました。
+これは簡単ですが、レスポンスはテキストになり、エラーごとに形が揺れやすくなります。
+Day 2 では、エラーをすべて JSON に統一しました。
+
+```go title="app/internal/handler/handler.go"
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, errorResponse{Error: message})
+}
+```
+
+不正な JSON は `400 Bad Request` と `{"error":"invalid json"}` です。
+存在しないコードは `404 Not Found` と `{"error":"link not found"}` です。
+
+呼び出し側は、失敗したら常に `error` フィールドを読めばよくなります。
+API は成功時だけでなく、失敗時も契約です。
+
+### URL バリデーション
+
+URL 短縮サービスは、ユーザーから URL を受け取ります。
+壊れた値を保存してしまうと、あとでリダイレクトするときに壊れた値を返すことになります。
+Day 2 では、保存する前に `validateURL` で検査します。
+
+```go title="app/internal/handler/handler.go"
+func validateURL(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return errors.New("url is required")
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("url is invalid")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("url must use http or https")
+	}
+	if parsed.Host == "" {
+		return errors.New("url host is required")
+	}
+	return nil
+}
+```
+
+最初に空文字と空白だけの文字列を弾きます。
+次に `net/url.Parse` で URL として解析できるか確認します。
+そのうえで、スキームが `http` または `https` か、ホストがあるかを見ます。
+
+ここでのポイントは、正規表現で全部を頑張って判定していないことです。
+URL の解析は標準ライブラリの `net/url` に任せ、サービスとして許可する条件だけを明示します。
+バリデーションは保存前の入口で行うのが基本です。
+
+### メタ情報取得 API
+
+Day 2 では、`GET /api/links/{code}` も追加されています。
+これは短縮 URL へリダイレクトする API ではなく、リンクの情報を JSON で取得する API です。
+
+実装では `r.PathValue("code")` でコードを取り出し、`h.store.Load(code)` で元 URL を探します。
+成功時は `200 OK` で、コード、元 URL、短縮 URL を返します。
+一方、`GET /1` はブラウザや `curl -L` が使うリダイレクト用です。
+同じ短縮コードを扱っていても、用途が違うためエンドポイントを分けています。
+
+### Go のテスト文化: table-driven と t.Run
+
+Go のテストは、標準の `testing` パッケージで書きます。
+Day 2 の `handler_test.go` は、ハンドラのふるまいを table-driven テストで確認しています。
+table-driven テストとは、入力と期待結果を構造体のスライスに並べ、同じ検証ロジックを繰り返す書き方です。
+
+```go title="app/internal/handler/handler_test.go"
+tests := []struct {
+	name         string
+	body         string
+	wantStatus   int
+	wantLocation string
+	wantBody     map[string]string
+}{
+	{name: "valid https url", body: `{"url":"https://example.com/articles/1"}`, wantStatus: http.StatusCreated},
+	{name: "unsupported scheme", body: `{"url":"ftp://example.com/file"}`, wantStatus: http.StatusBadRequest},
+}
+```
+
+この形式の利点は、ケースを増やしやすいことです。
+URL バリデーションでは、正常系だけでなく、空文字、空白、`ftp://`、スキームなし、ホストなし、パースエラーを確認したい領域です。
+同じテスト関数の中で、ケースを 1 行ずつ足していけます。
+
+それぞれのケースは `t.Run` でサブテストにしています。
+
+```go title="app/internal/handler/handler_test.go"
+for _, tt := range tests {
+	t.Run(tt.name, func(t *testing.T) {
+		h, _ := newTestHandler()
+		req := httptest.NewRequest(http.MethodPost, "/api/links", strings.NewReader(tt.body))
+		rec := httptest.NewRecorder()
+
+		h.ServeHTTP(rec, req)
+		if rec.Code != tt.wantStatus {
+			t.Fatalf("status = %d, want %d; body=%s", rec.Code, tt.wantStatus, rec.Body.String())
+		}
+	})
+}
+```
+
+`t.Run(tt.name, ...)` を使うと、失敗したときにどのケースが落ちたか分かります。
+これは、分岐が多いバリデーションのテストで特に助かります。
+
+### httptest の仕組み
+
+`httptest` は、実際にポートを開かずに HTTP ハンドラをテストするための標準パッケージです。
+Day 2 では、次の 2 つをよく使っています。
+
+```go title="app/internal/handler/handler_test.go"
+req := httptest.NewRequest(http.MethodPost, "/api/links", strings.NewReader(tt.body))
+rec := httptest.NewRecorder()
+
+h.ServeHTTP(rec, req)
+```
+
+`httptest.NewRequest` は、テスト用の `*http.Request` を作ります。
+`httptest.NewRecorder` は、レスポンスを記録する `ResponseRecorder` を作ります。
+ハンドラがステータスコード、ヘッダ、ボディを書き込むと、`rec.Code`、`rec.Header()`、`rec.Body` から確認できます。
+
+`GET /api/links/{code}` のテストでは、先にメモリストアへデータを入れてからリクエストしています。
+
+```go title="app/internal/handler/handler_test.go"
+h, store := newTestHandler()
+store.Save(tt.seedCode, tt.seedURL)
+req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+rec := httptest.NewRecorder()
+h.ServeHTTP(rec, req)
+```
+
+必要な状態をテスト内で作り、対象のハンドラを呼び、期待するレスポンスを見る。
+実際のネットワーク、空いているポート、サーバプロセスの起動待ちに依存しないため、テストが速く安定します。
+
+### go test -cover の見方
+
+Day 2 では `app/Makefile` も追加されています。
+`make test` は `go test ./...` を実行します。
+`./...` は、現在のモジュール配下の全パッケージを対象にする指定です。
+
+Go にはカバレッジ計測も標準で入っています。
+
+```sh
+go test -cover ./...
+```
+
+カバレッジは、テスト実行中にコードのどの文が通ったかを割合で示すものです。
+数値は便利ですが、点数として崇拝しないでください。
+`100%` でも期待値の確認が甘ければバグは残ります。
+API では、正常系だけでなく、壊れた入力や見つからないコードへの反応がテストに残っているかを見ます。
+
+## 手を動かす
+
+まず、アプリ側のテストを実行します。
+
+```sh
+cd app
+make test
+```
+
+期待出力は、`cmd/server` は `[no test files]`、`internal/handler`、`internal/shortener`、`internal/storage` は `ok` になる形です。
+
+続いてカバレッジを見ます。
+
+```sh
+go test -cover ./...
+```
+
+期待出力では、各パッケージの末尾に `coverage: ...% of statements` が表示されます。
+
+次に、ターミナルを 2 つ使ってエラー系を確認します。
+1 つ目でサーバを起動します。
+
+```sh
+make run
+```
+
+別のターミナルで、不正な JSON、空の URL、許可していないスキームを順に送ります。
+
+```sh
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{'
+```
+
+```sh
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":""}'
+```
+
+```sh
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"ftp://example.com/file"}'
+```
+
+期待出力はすべて `HTTP/1.1 400 Bad Request`、`Content-Type: application/json` です。
+本文は順に `{"error":"invalid json"}`、`{"error":"url is required"}`、`{"error":"url must use http or https"}` になります。
+
+正常系も 1 回だけ確認して、`201 Created` と `Location` を見ます。
+
+```sh
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/articles/go"}'
+```
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: http://localhost:8080/1
+
+{"code":"1","short_url":"http://localhost:8080/1"}
+```
+
+作成したリンクのメタ情報も取得します。
+
+```sh
+curl -i http://localhost:8080/api/links/1
+```
+
+期待出力は `200 OK` と `{"code":"1","url":"https://example.com/articles/go","short_url":"http://localhost:8080/1"}` です。
+
+存在しないコードは、メタ情報 API でもリダイレクト用パスでも JSON エラーになります。
+
+```sh
+curl -i http://localhost:8080/api/links/missing
+curl -i http://localhost:8080/missing
+```
+
+期待出力はどちらも `404 Not Found` と `{"error":"link not found"}` です。
+
+Day 1 では未知コードが標準の `404 page not found` でした。
+Day 2 では API として扱いやすいように、ここも JSON エラーへ揃っています。
+
+## クイズ
+
+<Quiz question="POST /api/links が成功したとき、200 OK ではなく 201 Created と Location ヘッダを返す主な理由はどれですか？" choices={['新しい短縮リンクを作成したことと、その場所を HTTP の意味として伝えるため', 'JSON の文字数を減らすため', 'Go の json.Encoder が 201 以外では動かないため', 'ブラウザのキャッシュを必ず無効化するため']} answer={0} explanation="201 Created はリソース作成の成功を表します。Location ヘッダには作成されたリソースの場所を入れられるため、短縮 URL 作成 API の契約として自然です。" />
+
+<Quiz question="table-driven テストの利点として最も適切なものはどれですか？" choices={['入力と期待結果を表に並べられるので、正常系と異常系を追加しやすい', 'テストを実行しなくても自動で本番に反映される', 'HTTP サーバのポート番号を固定できる', 'JSON のフィールド順を必ず固定できる']} answer={0} explanation="table-driven テストでは、ケースごとの入力と期待結果を構造体のスライスに並べます。分岐の多いバリデーションでは、ケースを追加しやすいことが大きな利点です。" />
+
+<Quiz question="httptest.NewRecorder の役割はどれですか？" choices={['ハンドラが書き込んだステータスコード、ヘッダ、ボディをテスト内で記録する', '本物のブラウザを起動して画面を撮影する', 'URL を短いコードへ変換する', 'リクエストボディの JSON を自動で修復する']} answer={0} explanation="httptest.NewRecorder は http.ResponseWriter としてハンドラに渡せる記録用オブジェクトです。rec.Code、rec.Header、rec.Body からレスポンスを検証できます。" />
+
+<Quiz question="URL バリデーションはどこで行うべきですか？" choices={['保存する前の入口で行い、壊れた値をストアへ入れないようにする', 'リダイレクトする直前だけで行えば十分', 'テストコードの中だけで行えば本番も安全になる', 'ブラウザが必ず正しい URL だけ送るので不要']} answer={0} explanation="バリデーションは入口で行うのが基本です。壊れた URL を保存してしまうと、取得やリダイレクトのたびに対処が必要になります。Day 2 では createLink の保存前に validateURL を呼んでいます。" />
+
+## 今日のまとめ
+
+今日は、URL 短縮サービスを API として扱いやすくするための設計を学びました。
+`POST /api/links` は新しい短縮リンクを作るため、成功時に `201 Created` を返し、`Location` ヘッダで作成された短縮 URL を示します。
+
+エラーは `{"error":"..."}` に統一しました。
+これは見た目の好みではなく、呼び出し側が失敗を安定して扱うための契約です。
+URL バリデーションでは、空文字、パースエラー、スキーム、ホストを確認しました。
+
+テストでは、`httptest.NewRequest` と `httptest.NewRecorder` を使い、実際にポートを開かずにハンドラを検証しました。
+table-driven テストと `t.Run` によって、正常系と異常系を読みやすく並べられます。
+`go test -cover` は、どの程度の文がテストで実行されたかを見る道具です。
+数値だけで満足せず、API の重要な契約がテストに残っているかを見てください。
+
+## 明日の予告
+
+Day 3 では、保存先を本格的に育てます。
+今日までは `MemoryStore` がプロセス内の `map` に保存していました。
+この方式はシンプルですが、サーバを再起動するとデータが消えます。
+
+明日は、保存処理をインターフェースとして切り出し、メモリ保存と SQLite 保存を差し替えられる形にします。
+ここで「HTTP ハンドラが具体的な保存実装に依存しすぎない設計」を学びます。
+後日の Postgres、Redis、Kubernetes へ進むための土台になります。
