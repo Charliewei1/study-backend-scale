@@ -8,8 +8,19 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 8 の演習を用意します。
+
+```bash
+./study start 8
+```
+
+`work/` に、実装する関数が `panic("TODO: ...")` になった Go コードと、TODO コメントだけが入った Compose ファイルや k6 スクリプトが用意されます。
+まず `./study test` を実行し、未実装のためテストが落ちることを確認してから、TODO を一つずつ埋めていきましょう。
+
 :::note[このページのコードについて]
-このページは Day 8 時点のコードを解説しています。当時のコードは `git checkout day08` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 8 時点のコードを解説しています。`./study start 8` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -21,6 +32,26 @@ import Quiz from '../../components/Quiz.astro';
 - Redis が落ちても Postgres へフォールバックして `302` を返す設計を読めるようになる。
 - `GET /api/cache/stats` の `{"hits":N,"misses":M}` でキャッシュの効き具合を観察できるようになる。
 - Day 7 と同じ負荷で、キャッシュ導入前後の実測値を比較できるようになる。
+
+## 今日つくるもの
+
+- `work/app/internal/cache/redis.go` の Redis アダプタとデコレータを実装します。
+  - `func (c goRedisClient) Get(ctx context.Context, key string) (string, error)` と `func (c goRedisClient) SetEX(ctx context.Context, key, value string, ttl time.Duration) error` は、`go-redis` の結果とエラーを、このファイルの `redisClient` インターフェースに合わせて返します。
+  - `func NewRedisStore(next storage.Storage, client *redis.Client) *RedisStore` と `func newRedisStore(next storage.Storage, client redisClient, ttl time.Duration) *RedisStore` は、保存先を包む `RedisStore` を作ります。TTL が 0 以下なら 24 時間を使います。
+  - `func (s *RedisStore) Save(ctx context.Context, code, url string) error`、`func (s *RedisStore) Get(ctx context.Context, code string) (storage.Link, error)`、`func (s *RedisStore) IncrementClicks(ctx context.Context, code string) error` は、包んだ保存先の結果とエラーをそのまま返します。
+  - `func (s *RedisStore) Load(ctx context.Context, code string) (string, error)` は、`shortlink:url:{code}` を Redis から読みます。ヒット時は URL を返して hit を増やし、キーがない場合や Redis の取得エラー時は miss を増やして保存先へフォールバックします。
+  - 保存先で URL が見つからないなどのエラーはそのまま返し、その値を Redis へ保存しません。Redis への取得・保存が失敗しても、保存先から URL を取得できたリクエストは成功させます。
+  - `func (s *RedisStore) Stats() Stats` は並行アクセス中も安全に hit と miss のスナップショットを返し、`func cacheKey(code string) string` は決められた prefix を付けたキーを返します。
+- `work/app/cmd/server/main.go` の `func withRedisCache(store storage.Storage) (storage.Storage, func(), cache.StatsProvider)` を実装します。
+  - `REDIS_ADDR` が空ならキャッシュを無効にして元の保存先を返します。設定されていれば 200ms の接続・読み取り・書き込みタイムアウトを持つ Redis クライアントで保存先を包み、統計の取得元とクライアントを閉じる関数も返します。
+- `work/app/internal/handler/handler.go` の `func (h *Handler) getCacheStats(w http.ResponseWriter, r *http.Request)` を実装します。
+  - `GET /api/cache/stats` は `200 OK` と `application/json` で `{"hits":N,"misses":M}` を返します。キャッシュが無効な場合は両方を 0 にします。
+- `work/deploy/compose.yaml` を作り、app、Postgres、Redis の 3 サービスを接続します。
+  - app には `REDIS_ADDR=redis:6379` を渡し、Postgres と Redis の healthcheck が成功してから起動する構成にします。Redis は `redis:7-alpine` と `redis-cli ping` を使います。
+- `work/load/day08-cached.js` を作ります。
+  - Day 7 と同じ 2 分間の `ramping-vus`、p95 100ms 未満、HTTP 失敗率 1% 未満、90% redirect / 10% create の条件を保ちます。redirect は外部 URL を追跡せず、`302` と `Location` を確認します。
+- 既存 API の契約を保ちます。`POST /api/links` で作ったコードへ `GET /{code}` すると、Redis の状態にかかわらず、保存先から読める限り `302 Found` と元の URL を返します。
+- 合格条件は、TODO が残っておらず、`go build ./...`、`go vet ./...`、`go test -race ./...` がすべて通ることです。リポジトリのルートから `./study test` でまとめて確認できます。
 
 ## 解説
 
@@ -90,6 +121,9 @@ type RedisStore struct {
 まず Redis を読み、成功したら hit を増やして返します。
 Redis にない場合や Redis が失敗した場合は、miss を増やして保存先へ進みます。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/cache/redis.go"
 if url, err := s.client.Get(ctx, key); err == nil {
 	s.hits.Add(1)
@@ -113,6 +147,8 @@ if err := s.client.SetEX(ctx, key, url, s.ttl); err != nil {
 重要なのは、Redis のエラーをユーザーへ返していないことです。
 Redis が落ちても、Postgres から読めるなら `302` を返します。
 キャッシュは正しさの本体ではなく、速くするための補助です。
+
+</details>
 
 ### 書き込みと TTL
 
@@ -142,6 +178,9 @@ TTL を短くすると鮮度は上がりますが、キャッシュミスが増�
 Redis は `REDIS_ADDR` が設定されているときだけ有効になります。
 設定がなければ、キャッシュなしで保存先をそのまま使います。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/cmd/server/main.go"
 redisAddr := os.Getenv("REDIS_ADDR")
 if redisAddr == "" {
@@ -157,6 +196,8 @@ cached := cache.NewRedisStore(store, client)
 タイムアウトが 200ms に設定されている点も大事です。
 Redis が落ちているときに長く待つと、キャッシュの障害がアプリ全体の遅さになります。
 短く諦め、Postgres にフォールバックします。
+
+</details>
 
 Compose では、app、postgres、redis の 3 サービスが起動します。
 `deploy/compose.yaml` の app は `STORAGE=postgres`、`DATABASE_URL=...@postgres:5432/...`、`REDIS_ADDR=redis:6379` を受け取り、Redis の healthcheck を待って起動します。
@@ -209,16 +250,52 @@ p95 だけを計算すると約 6% 下がっています。
 
 ## 手を動かす
 
-まず Compose で app、Postgres、Redis を起動します。
+### 1. TODO を実装する
 
-```sh
-cd deploy
-docker compose up -d --build
+`work/` の骨組みを開き、まず Redis デコレータを実装します。
+`RedisStore.Load` だけでなく、保存先への委譲、統計、サーバへの組み込み、統計 API まで一つずつ進めてください。
+
+続いて `work/deploy/compose.yaml` と `work/load/day08-cached.js` の TODO を埋めます。
+残っている場所は、リポジトリのルートからいつでも確認できます。
+
+```bash
+./study todo
+```
+
+### 2. テストで確かめる
+
+TODO を埋めたら、合格条件を実行します。
+
+```bash
+./study test
+```
+
+失敗した場合は、最初のエラーから直してもう一度実行します。
+TODO の確認、ビルド、vet、race detector 付きテストがすべて通れば合格です。
+
+```txt
+✅ Day08 の合格条件を満たしています
+```
+
+### 3. `./study run` で実際に叩く
+
+まず、ホストの `6379` ポートで演習用 Redis を起動します。
+
+```bash
+docker run --rm --name shortlink-day08-redis \
+  -p 6379:6379 -d redis:7-alpine
+```
+
+別のターミナルで Redis の接続先を指定して、自分が書いたサーバを起動します。
+この確認では保存先はメモリですが、Redis のヒット、ミス、障害時のフォールバックを手早く観察できます。
+
+```bash
+REDIS_ADDR=localhost:6379 ./study run
 ```
 
 ヘルスチェックで、アプリが起動していることを確認します。
 
-```sh
+```bash
 curl http://localhost:8080/healthz
 ```
 
@@ -230,7 +307,7 @@ ok
 
 短縮リンクを作ります。
 
-```sh
+```bash
 curl -i -X POST http://localhost:8080/api/links \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com/day08/cache-aside"}'
@@ -252,7 +329,7 @@ Location: http://localhost:8080/1
 
 1 回目のリダイレクトを確認します。
 
-```sh
+```bash
 curl -i http://localhost:8080/1
 ```
 
@@ -265,7 +342,7 @@ Location: https://example.com/day08/cache-aside
 
 この 1 回目は Redis にまだないので miss です。
 
-```sh
+```bash
 curl http://localhost:8080/api/cache/stats
 ```
 
@@ -277,7 +354,7 @@ curl http://localhost:8080/api/cache/stats
 
 同じ code にもう一度アクセスします。
 
-```sh
+```bash
 curl -i http://localhost:8080/1
 ```
 
@@ -290,7 +367,7 @@ Location: https://example.com/day08/cache-aside
 
 2 回目は Redis から読めるので hit になります。
 
-```sh
+```bash
 curl http://localhost:8080/api/cache/stats
 ```
 
@@ -300,16 +377,15 @@ curl http://localhost:8080/api/cache/stats
 {"hits":1,"misses":1}
 ```
 
-次に、Redis だけを止めます。
-app と Postgres は動かしたままです。
+次に Redis を止め、`./study run` のサーバは動かしたままにします。
 
-```sh
-docker compose stop redis
+```bash
+docker stop shortlink-day08-redis
 ```
 
 Redis が止まっていても、リダイレクトが返ることを確認します。
 
-```sh
+```bash
 curl -i http://localhost:8080/1
 ```
 
@@ -320,21 +396,56 @@ HTTP/1.1 302 Found
 Location: https://example.com/day08/cache-aside
 ```
 
-Redis は落ちていますが、Postgres には保存されています。
-アプリは Redis の失敗をログに出し、Postgres へフォールバックして `302` を返します。
+Redis は落ちていますが、元の保存先には URL が残っています。
+アプリは Redis の失敗をログに出し、保存先へフォールバックして `302` を返します。
+確認できたら、`./study run` を実行しているターミナルで `Ctrl-C` を押します。
+
+### 4. Compose で Postgres との組み合わせを確かめる
+
+今度は、自分で書いた Compose ファイルを使い、app、Postgres、Redis を一緒に起動します。
+
+```bash
+cd work/deploy
+docker compose up -d --build
+```
+
+先ほどと同じ `curl` で短縮リンクを作り、1 回アクセスしてください。
+別の code が返った場合は、以下の `1` をその code に置き換えます。
+
+```bash
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/day08/cache-aside"}'
+curl -i http://localhost:8080/1
+```
+
+Redis だけを止め、app と Postgres は動かしたままにします。
+
+```bash
+docker compose stop redis
+curl -i http://localhost:8080/1
+```
+
+Redis が止まっていても、Postgres へフォールバックするため、期待出力は同じ `302` です。
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/day08/cache-aside
+```
 
 Redis を戻します。
 
-```sh
+```bash
 docker compose start redis
 ```
 
-最後に k6 で Day 8 の負荷試験を実行します。
-リポジトリルートへ戻ってから実行します。
+### 5. k6 で比較する
 
-```sh
-cd ..
-k6 run load/day08-cached.js
+最後に、リポジトリのルートへ戻り、自分で書いた Day 8 の負荷試験を実行します。
+
+```bash
+cd ../..
+k6 run work/load/day08-cached.js
 ```
 
 見るべき出力は、失敗率、平均、p95、req/s です。
@@ -359,10 +470,17 @@ http_reqs......................: ... 27/s
 
 確認が終わったら、片付けます。
 
-```sh
-cd deploy
+```bash
+cd work/deploy
 docker compose down -v
 ```
+
+## 詰まったら
+
+- `./study hint` は、答えを開く前に cache-aside や TTL の考え方を確認したいときに使います。
+- `./study todo` は、`work/` に残っている未実装の関数やファイルを一覧したいときに使います。
+- `./study answer` は、自分の実装と Day 8 の模範解答の差分をまとめて確認したいときに使います。
+- `./study peek <パス>` は、どうしても進めないファイルだけ模範解答をそのまま読みたいときに使います。たとえば `./study peek app/internal/cache/redis.go` です。
 
 ## クイズ
 

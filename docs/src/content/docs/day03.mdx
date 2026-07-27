@@ -8,8 +8,23 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 3 の演習を始めます。
+
+```bash
+./study start 3
+```
+
+`work/` に、実装する関数が `panic("TODO: ...")` になった骨組みが用意されます。
+まずは次のコマンドを実行し、未実装の状態ではテストが落ちることを確認してから始めましょう。
+
+```bash
+./study test
+```
+
 :::note[このページのコードについて]
-このページは Day 3 時点のコードを解説しています。当時のコードは `git checkout day03` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 3 時点のコードを解説しています。`./study start 3` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -22,6 +37,35 @@ import Quiz from '../../components/Quiz.astro';
 - `context.Context` を HTTP リクエストから storage 層へ伝播する意味を理解する。
 - `ErrNotFound` のようなセンチネルエラーと `errors.Is` の使い方に慣れる。
 - `STORAGE=sqlite` で起動し、再起動後も短縮リンクが残ることを確認する。
+
+## 今日つくるもの
+
+今日は `work/app/` の保存層と、その保存層を使うハンドラ・起動処理を実装します。
+ここでは完成コードではなく、満たすべき契約だけを確認しておきましょう。
+
+- `internal/storage/storage.go` を作り、`Link`、`ErrNotFound`、次のメソッドを持つ `Storage` インターフェースを定義する。
+  - `Save(ctx context.Context, code, url string) error`
+  - `Load(ctx context.Context, code string) (string, error)`
+  - `Get(ctx context.Context, code string) (Link, error)`
+- `internal/storage/memory.go` の `Save` と `Load` を上のシグネチャへ変更し、`Get(ctx context.Context, code string) (Link, error)` を実装する。
+  - 保存したコードは `Load` と `Get` で取得でき、同じコードを再保存すると新しい URL へ更新されること。
+  - コードが存在しない場合は `ErrNotFound` を返し、キャンセル済みの context はエラーとして扱うこと。
+- `internal/storage/sqlite.go` を作り、次の関数とメソッドを実装する。
+  - `NewSQLiteStore(ctx context.Context, path string) (*SQLiteStore, error)`
+  - `(*SQLiteStore).init(ctx context.Context) error`
+  - `(*SQLiteStore).Close() error`
+  - `(*SQLiteStore).Save(ctx context.Context, code, url string) error`
+  - `(*SQLiteStore).Load(ctx context.Context, code string) (string, error)`
+  - `(*SQLiteStore).Get(ctx context.Context, code string) (Link, error)`
+  - 指定した SQLite ファイルを開いて必要なテーブルを用意し、保存・取得・同じコードの更新ができること。存在しないコードは `ErrNotFound` として扱うこと。
+- `internal/handler/handler.go` で保存先を `storage.Storage` として受け取り、`writeStorageError(w http.ResponseWriter, err error)` を実装する。
+  - HTTP リクエストの context を保存層へ渡すこと。
+  - `ErrNotFound` は `404` と `{"error":"link not found"}`、それ以外の保存エラーは `500` と `{"error":"internal server error"}` に変換すること。
+  - 既存の API 契約を保つこと。作成は `201 Created`、取得はリンク情報の JSON、リダイレクトは `302 Found` を返す。
+- `cmd/server/main.go` に `newStore() (storage.Storage, func())` を実装する。
+  - `STORAGE` が空または `memory` ならメモリ、`sqlite` なら `SQLITE_PATH` の SQLite を使うこと。`SQLITE_PATH` が空なら `data.db` を使うこと。
+  - SQLite の接続は終了時に閉じ、未対応の `STORAGE` は起動エラーとして扱うこと。
+- 合格条件は、TODO を残さず、`./study test` が行う `go build ./...`、`go vet ./...`、`go test ./...` をすべて通すこと。
 
 ## 解説
 
@@ -113,6 +157,9 @@ SQLite では、`database/sql` が行なしを `sql.ErrNoRows` として返し�
 しかし、ハンドラに `sql.ErrNoRows` を直接知らせると、ハンドラが SQLite や `database/sql` の事情を知ることになります。
 そこで storage 層で `ErrNotFound` へ変換します。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/storage/sqlite.go"
 if err := s.db.QueryRowContext(ctx, query, code).Scan(&link.Code, &link.URL); err != nil {
 	if errors.Is(err, sql.ErrNoRows) {
@@ -121,6 +168,8 @@ if err := s.db.QueryRowContext(ctx, query, code).Scan(&link.Code, &link.URL); er
 	return Link{}, fmt.Errorf("get link: %w", err)
 }
 ```
+
+</details>
 
 ハンドラ側は、保存先がメモリか SQLite かを気にせず `writeStorageError` の中で `errors.Is(err, storage.ErrNotFound)` と判定します。
 `errors.Is` を使う理由は、エラーがラップされても判定できるからです。
@@ -163,20 +212,18 @@ HTTP サーバでは、複数のリクエストが同時に来ます。
 
 SQLite の初期化では、`sql.Open("sqlite", path)` で `*sql.DB` を作り、続けて `CREATE TABLE IF NOT EXISTS links (...)` を `ExecContext` で実行します。
 `links` テーブルでは、`code` が主キーです。
-同じコードを 2 回保存しようとした場合は、主キー制約で保存に失敗します。
+同じコードを 2 回保存した場合は、`ON CONFLICT` で URL を新しい値へ更新します。
 
 ```go title="app/internal/storage/sqlite.go"
-const query = `
-INSERT INTO links (code, url)
-VALUES (?, ?);`
+ON CONFLICT(code) DO UPDATE SET url = excluded.url;
 ```
 
 Day 3 時点では、短縮コード生成器のカウンタはまだメモリ上にあります。
 そのため、サーバ再起動後に新しいリンクを作ると、また `"1"` から採番されます。
-そこで保存は insert-only にし、衝突したら次のコードでリトライすることで、既存リンクを上書きする事故を防いでいます。
-ただし、これは根本解決ではありません。
+Day 3 の実装では同じコードを保存すると既存 URL を更新するため、再起動後に新しいリンクを作ると既存の `"1"` が上書きされる可能性があります。
+これは根本解決ではありません。
 複数台構成でも安全な ID 採番は、Day 11 でランダム base62 へ進むときに扱います。
-今回の手順では「作ったリンクが再起動後も読めること」を確認します。
+今回の手順では、再起動後に新しいリンクを作る前に「以前作ったリンクが読めること」を確認します。
 
 ### modernc.org/sqlite を選んだ理由
 
@@ -201,17 +248,33 @@ Day 6 では、ネットワーク越しに複数プロセスから使える Post
 `STORAGE` 環境変数が空、または `memory` ならメモリ保存です。
 `sqlite` なら SQLite 保存です。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/cmd/server/main.go"
-switch os.Getenv("STORAGE") {
-case "", "memory":
-	return storage.NewMemoryStore(), func() {}
-case "sqlite":
-	path := os.Getenv("SQLITE_PATH")
-	if path == "" {
-		path = "data.db"
+func newStore() (storage.Storage, func()) {
+	switch os.Getenv("STORAGE") {
+	case "", "memory":
+		return storage.NewMemoryStore(), func() {}
+	case "sqlite":
+		path := os.Getenv("SQLITE_PATH")
+		if path == "" {
+			path = "data.db"
+		}
+
+		store, err := storage.NewSQLiteStore(context.Background(), path)
+		if err != nil {
+			log.Fatalf("initialize sqlite storage: %v", err)
+		}
+		return store, func() {
+			if err := store.Close(); err != nil {
+				log.Printf("close sqlite storage: %v", err)
+			}
+		}
+	default:
+		log.Fatalf("unsupported STORAGE %q; want memory or sqlite", os.Getenv("STORAGE"))
+		return nil, func() {}
 	}
-	store, err := storage.NewSQLiteStore(context.Background(), path)
-	// エラー処理と Close は実コードで行っています。
 }
 ```
 
@@ -226,18 +289,49 @@ SQLite 実装のテストでは、`t.TempDir()` でテストごとの一時 DB �
 また、見つからないケースは `errors.Is(err, ErrNotFound)` で確認しています。
 テストが見ているのは SQLite 内部の `sql.ErrNoRows` ではなく、storage パッケージが外へ出す契約です。
 
+</details>
+
 ## 手を動かす
 
-ここでは、SQLite 保存に切り替えて、再起動後もリダイレクトが生きていることを確認します。
-ターミナルを 2 つ使います。
-1 つ目でサーバを起動し、2 つ目で `curl` を実行します。
+ここからは、`work/` の骨組みを自分で実装し、テストと実際の HTTP リクエストで確かめます。
 
-まず、古い確認用 DB があれば消してから起動します。
+### 1. 実装する
 
-```sh
-cd app
+まず、残っている TODO を確認します。
+
+```bash
+./study todo
+```
+
+最初は `Storage` の契約を読み、それを満たすようにメモリ保存と SQLite 保存を実装すると進めやすいです。
+その後、ハンドラへ context を渡す処理とエラー変換を加え、最後に起動時の保存先切り替えを実装しましょう。
+TODO として表示されない既存関数にもシグネチャ変更が必要です。コンパイルエラーとテストを、次に直す場所を示す手がかりにしてください。
+
+### 2. `./study test` で確かめる
+
+ひとまとまり実装するたびに、リポジトリのルートでテストを実行します。
+
+```bash
+./study test
+```
+
+このコマンドは TODO の有無に加えて、ビルド、`go vet`、Go のテストを確認します。
+すべて実装できると、最後に次のように表示されます。
+
+```txt
+✅ Day03 の合格条件を満たしています
+```
+
+### 3. `./study run` で実際に叩く
+
+テストが通ったら、SQLite 保存に切り替えて、再起動後もリダイレクトが生きていることを確認します。
+ターミナルを 2 つ使い、1 つ目でサーバを起動し、2 つ目で `curl` を実行します。
+
+まず、古い確認用 DB があれば消し、1 つ目のターミナルでサーバを起動します。
+
+```bash
 rm -f /tmp/shortlink-day03.db
-STORAGE=sqlite SQLITE_PATH=/tmp/shortlink-day03.db go run ./cmd/server
+STORAGE=sqlite SQLITE_PATH=/tmp/shortlink-day03.db ./study run
 ```
 
 期待するログは次の形です。
@@ -248,7 +342,7 @@ shortlink server listening on :8080
 
 別のターミナルで、短縮リンクを作ります。
 
-```sh
+```bash
 curl -i -X POST http://localhost:8080/api/links \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com/articles/sqlite"}'
@@ -266,7 +360,7 @@ Location: http://localhost:8080/1
 
 念のため、リダイレクトを確認します。
 
-```sh
+```bash
 curl -i http://localhost:8080/1
 ```
 
@@ -278,13 +372,13 @@ Location: https://example.com/articles/sqlite
 次に、1 つ目のターミナルで `Ctrl+C` を押してサーバを止めます。
 同じ SQLite ファイルを指定して、もう一度起動します。
 
-```sh
-STORAGE=sqlite SQLITE_PATH=/tmp/shortlink-day03.db go run ./cmd/server
+```bash
+STORAGE=sqlite SQLITE_PATH=/tmp/shortlink-day03.db ./study run
 ```
 
 再起動後に、同じ短縮コードへアクセスします。
 
-```sh
+```bash
 curl -i http://localhost:8080/1
 ```
 
@@ -297,7 +391,7 @@ Location: https://example.com/articles/sqlite
 
 メタ情報 API でも確認できます。
 
-```sh
+```bash
 curl -i http://localhost:8080/api/links/1
 ```
 
@@ -314,7 +408,7 @@ Content-Type: application/json
 
 存在しないコードも確認しておきます。
 
-```sh
+```bash
 curl -i http://localhost:8080/missing
 ```
 
@@ -327,6 +421,13 @@ Content-Type: application/json
 
 保存先が SQLite でも、ハンドラから見るとエラーは `storage.ErrNotFound` です。
 そのため、メモリ保存と同じ JSON エラーを返せます。
+
+## 詰まったら
+
+- `./study hint`：今日の考え方や実装の手がかりを読みたいときに使います。
+- `./study todo`：まだ埋めていない TODO と対象ファイルを確認したいときに使います。
+- `./study answer`：自分の実装と模範解答の差分をまとめて確認したいときに使います。
+- `./study peek <パス>`：指定した 1 ファイルの模範解答をそのまま確認したいときに使います。まず自分で書いてから、必要な箇所だけ見てみましょう。
 
 ## クイズ
 

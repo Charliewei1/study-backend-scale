@@ -8,8 +8,23 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 11 の演習を用意します。
+
+```bash
+./study start 11
+```
+
+`work/` に、関数の中身が `panic("TODO: ...")` になった Go コードや、TODO コメントだけが入ったマニフェストなどの骨組みが置かれます。
+まずは次のコマンドを実行し、未実装のためテストが落ちることを確認してから始めましょう。
+
+```bash
+./study test
+```
+
 :::note[このページのコードについて]
-このページは Day 11 時点のコードを解説しています。当時のコードは `git checkout day11` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 11 時点のコードを解説しています。`./study start 11` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -22,6 +37,28 @@ import Quiz from '../../components/Quiz.astro';
 - HPA が `desiredReplicas = ceil(currentReplicas × currentMetric / targetMetric)` で Pod 数を調整することを理解する。
 - metrics-server が HPA と `kubectl top` に CPU/メモリ指標を渡す役割を持つことを説明できるようになる。
 - k6 で負荷をかけ、`kubectl get hpa -w` でレプリカ数が増える様子を観察できるようになる。
+
+## 今日つくるもの
+
+今日は、次の関数とファイルを完成させます。ここでは実装方法ではなく、満たすべき契約だけを確認しておきましょう。
+
+- `app/internal/shortener/shortener.go`
+  - `func New() *Shortener` は、Pod 内に連番の状態を持たない採番器を返す。
+  - `func (s *Shortener) Next() (string, error)` は、`0-9`、`a-z`、`A-Z` だけからなる 7 文字のコードを返す。
+  - ランダム値の生成に失敗した場合は、空文字列と原因を包んだエラーを返す。
+- `app/internal/handler/handler.go`
+  - `func (h *Handler) createLink(w http.ResponseWriter, r *http.Request)` で、コード生成と保存を最大 5 回試す。
+  - `storage.ErrConflict` のときだけ新しいコードで再試行し、その他の保存エラーやコード生成エラーはすぐに `500` と `{"error":"internal server error"}` を返す。
+  - 保存できたら、従来どおり `201 Created`、`Location` ヘッダー、`code` と `short_url` を含む JSON を返す。5 回すべて衝突した場合は `500` を返す。
+- `deploy/k8s/base/03-hpa.yaml`
+  - `shortlink` Deployment を対象に、CPU 使用率 70% を目標として、2〜10 Pod の範囲で調整する `autoscaling/v2` の HorizontalPodAutoscaler を定義する。
+- `deploy/k8s/README.md`
+  - metrics-server v0.8.1 の導入、kind 用の `--kubelet-insecure-tls` 設定、メトリクス確認、HPA 監視、port-forward、k6 実行までの手順を追記する。
+- `load/day11-scale.js`
+  - 既定で毎秒 600 リクエストを 5 分間送る constant-arrival-rate シナリオを作る。`RATE` と `BASE_URL` は環境変数で変更できるようにする。
+  - `POST /api/links` の `201` とコードの有無を確認し、20 回に 1 回は `GET /{code}` の `302` と `Location` を確認する。
+  - 全体と `POST /api/links` の p95 を 500ms 未満、失敗率を 5% 未満とする threshold を定義する。
+- 合格条件は、`work/` の TODO がすべてなくなり、`go build ./...`、`go vet ./...`、`go test -race ./...` がすべて通ることです。`./study test` でまとめて確認できます。
 
 ## 解説
 
@@ -90,6 +127,9 @@ ReplicaSet が自己修復で Pod を作り直すたびに、ローカルカウ�
 Day 11 の `app/internal/shortener/shortener.go` は、プロセス内の連番を持ちません。
 `crypto/rand` で 7 文字の base62 コードを作ります。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/shortener/shortener.go"
 const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 const codeLength = 7
@@ -118,10 +158,15 @@ Pod A でも Pod B でも、同じロジックでランダムにコードを作�
 PostgreSQL では `code` が主キーです。
 `app/internal/storage/postgres.go` は `ON CONFLICT (code) DO NOTHING` を使い、重複して `RowsAffected() == 0` なら `storage.ErrConflict` を返します。
 
+</details>
+
 ### 衝突したら小さくリトライする
 
 ハンドラ側では、短縮コード生成と保存を最大 5 回まで試します。
 `ErrConflict` だけをリトライ対象にし、それ以外の DB エラーはすぐ 500 にします。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```go title="app/internal/handler/handler.go"
 func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +223,8 @@ Pod はローカルに採番状態を持ちません。
 ここで大事なのは、「衝突を絶対に起こさない」ではなく「衝突しても正しく処理できる」です。
 分散システムでは、珍しい事象を 0 とみなすより、起きたときの逃げ道を小さく用意するほうが堅い設計になります。
 
+</details>
+
 ### 分散 ID 採番の選択肢
 
 分散環境で一意な ID を作る方法はいくつかあります。
@@ -227,6 +274,9 @@ base62 は、1 文字に 62 種類を使う表現です。
 HPA は、負荷指標を見て Deployment の `replicas` を自動で変更するコントローラです。
 今回のマニフェストは `deploy/k8s/base/03-hpa.yaml` です。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```yaml title="deploy/k8s/base/03-hpa.yaml"
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -254,6 +304,8 @@ spec:
 Deployment 側には `deploy/k8s/base/deployment.yaml` で `requests.cpu: 50m` が書かれています。
 HPA の CPU utilization は CPU request を基準にするため、Pod が平均で `35m` 使うと `35m / 50m = 70%` です。
 CPU request を書いていないと、CPU 使用率ベースの HPA は判断材料を持てません。
+
+</details>
 
 ### HPA の計算式
 
@@ -301,30 +353,92 @@ shortlink   Deployment/shortlink   cpu: 2%/70%   2         10        2
 
 ## 手を動かす
 
-ここからは実際に HPA を観察します。
-リポジトリルートから始めます。
-Day 9 や Day 10 の kind クラスタが残っている場合は、クラスタ作成とイメージ読み込みは状況に合わせて省略できます。
+### 1. TODO を実装する
 
-```sh
-kind create cluster --config deploy/kind-config.yaml --name shortlink
-docker build -f deploy/Dockerfile -t shortlink:dev app
+リポジトリのルートで、まず残っている課題を確認します。
+
+```bash
+./study todo
+```
+
+`work/app/internal/shortener/shortener.go` と `work/app/internal/handler/handler.go` の関数を実装し、`work/deploy/k8s/base/03-hpa.yaml`、`work/deploy/k8s/README.md`、`work/load/day11-scale.js` を完成させてください。
+テストは仕様書でもあります。短縮コードの形式や衝突時の挙動に迷ったら、先に `work/app/internal/shortener/shortener_test.go` と `work/app/internal/handler/handler_test.go` を読んでみましょう。
+
+### 2. `./study test` で確かめる
+
+ひととおり書けたら、合格条件をまとめて確認します。
+
+```bash
+./study test
+```
+
+失敗した場合は、最初に表示されたエラーから一つずつ直します。
+`go build`、`go vet`、`go test -race` がすべて通り、最後に `✅ Day11 の合格条件を満たしています` と表示されれば合格です。
+
+### 3. `./study run` で API を実際に叩く
+
+テストが通ったら、書いたサーバーを起動します。
+
+```bash
+./study run
+```
+
+別のターミナルからリンクを作成してください。
+
+```bash
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/articles/1"}'
+```
+
+コードの値は実行するたびに変わりますが、7 文字の base62 コード、`201 Created`、`Location` ヘッダーを確認できます。
+
+```txt
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: http://localhost:8080/aB3xY9z
+
+{"code":"aB3xY9z","short_url":"http://localhost:8080/aB3xY9z"}
+```
+
+返ってきたコードを使い、リダイレクトも確かめます。
+
+```bash
+curl -i http://localhost:8080/aB3xY9z
+```
+
+```txt
+HTTP/1.1 302 Found
+Location: https://example.com/articles/1
+```
+
+確認できたら `Ctrl-C` でサーバーを止めます。
+
+### 4. Kubernetes で HPA を観察する
+
+ここからは、自分で書いたコードとマニフェストを使って HPA を観察します。
+Day 9 や Day 10 の kind クラスタが残っている場合は、クラスタ作成とイメージ読み込みを状況に合わせて省略できます。
+
+```bash
+kind create cluster --config work/deploy/kind-config.yaml --name shortlink
+docker build -f work/deploy/Dockerfile -t shortlink:dev work/app
 kind load docker-image shortlink:dev --name shortlink
 ```
 
 base マニフェストを適用します。
 Day 11 では `03-hpa.yaml` も `base/` に含まれます。
 
-```sh
-kubectl apply -f deploy/k8s/base
+```bash
+kubectl apply -f work/deploy/k8s/base
 kubectl get deploy,pod,svc,hpa -n shortlink
 ```
 
 負荷をかける前に、Day 10 参照の流れで PostgreSQL 構成へ切り替えます。
-`deploy/k8s/base` だけでは `STORAGE=memory` のままなので、Pod ごとにリンクデータが分離します。
+`work/deploy/k8s/base` だけでは `STORAGE=memory` のままなので、Pod ごとにリンクデータが分離します。
 その状態で k6 が `POST /api/links` の後に別 Pod へ `GET /{code}` すると、作成したリンクが見つからず 404 になることがあります。
 
-```sh
-kubectl apply -f deploy/k8s/postgres/
+```bash
+kubectl apply -f work/deploy/k8s/postgres/
 kubectl rollout restart deployment/shortlink -n shortlink
 kubectl rollout status deployment/shortlink -n shortlink
 ```
@@ -337,7 +451,7 @@ metrics-server がまだない場合、HPA の `TARGETS` は `<unknown>/70%` に
 これは HPA が壊れているというより、CPU メトリクスの提供元がまだ無い状態です。
 次の URL は、この教材で検証済みの v0.8.1 に固定しています。
 
-```sh
+```bash
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.8.1/components.yaml
 kubectl patch deployment metrics-server -n kube-system --type=json \
   -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
@@ -346,7 +460,7 @@ kubectl rollout status deployment/metrics-server -n kube-system
 
 メトリクスが見えるか確認します。
 
-```sh
+```bash
 kubectl top node
 kubectl top pod -n shortlink
 kubectl get hpa -n shortlink
@@ -361,13 +475,13 @@ shortlink   Deployment/shortlink   cpu: 2%/70% 2         10        2
 大事なのは、`<unknown>` ではなく `cpu: 現在値/70%` の形で見えることです。
 
 :::note
-HPA が動いている間に `deploy/k8s/base/deployment.yaml` を再 apply すると、Deployment の `spec.replicas: 2` が一旦反映されます。
+HPA が動いている間に `work/deploy/k8s/base/deployment.yaml` を再 apply すると、Deployment の `spec.replicas: 2` が一旦反映されます。
 HPA がすぐに現在の負荷を見て再調整しますが、Pod 数が一瞬 2 に戻っても驚かなくて大丈夫です。
 :::
 
 次は 3 つのターミナルを並べます。
 
-```sh
+```bash
 # terminal 1
 kubectl get hpa -n shortlink -w
 
@@ -375,10 +489,10 @@ kubectl get hpa -n shortlink -w
 kubectl port-forward svc/shortlink 8080:80 -n shortlink
 
 # terminal 3
-BASE_URL=http://localhost:8080 k6 run load/day11-scale.js
+BASE_URL=http://localhost:8080 k6 run work/load/day11-scale.js
 ```
 
-`load/day11-scale.js` は、一定到着率で `POST /api/links` を実行します。
+`work/load/day11-scale.js` は、一定到着率で `POST /api/links` を実行します。
 20 回に 1 回は作成した短縮コードへ `GET /{code}` し、`302` も確認します。
 デフォルトは `RATE=600`、`duration: '5m'` で、`http_req_duration` と `http_req_failed` の threshold も定義されています。
 
@@ -387,7 +501,7 @@ CPU 使用率が目標を超えた状態が観測されると、HPA は Deployme
 
 同時に Pod 数も見ておくと、Deployment が新しい Pod を作る様子が分かります。
 
-```sh
+```bash
 kubectl get pod -n shortlink -w
 ```
 
@@ -400,8 +514,8 @@ new shortlink Pod: ContainerCreating -> Running
 k6 側では、成功率と p95 レイテンシを見ます。
 負荷が強すぎる場合は、`RATE` を下げます。
 
-```sh
-RATE=300 BASE_URL=http://localhost:8080 k6 run load/day11-scale.js
+```bash
+RATE=300 BASE_URL=http://localhost:8080 k6 run work/load/day11-scale.js
 ```
 
 負荷が終わったら、すぐに Pod が 2 個へ戻るとは限りません。
@@ -416,6 +530,13 @@ REPLICAS はすぐには下がらない
 この待ち時間は、Kubernetes がサボっているわけではありません。
 一時的な負荷低下に反応してすぐ Pod を減らすと、直後の負荷再上昇でまた増やすことになります。
 その振動を避けるため、スケールアップよりスケールダウンは保守的に動きます。
+
+## 詰まったら
+
+- `./study hint`：今日の考え方と実装のヒントを読みたいときに使います。
+- `./study todo`：まだ残っている TODO と対象ファイルを確認したいときに使います。
+- `./study answer`：自分の実装と模範解答の差分をまとめて比較したいときに使います。
+- `./study peek <パス>`：どうしても進めないファイルだけ、模範解答をそのまま確認したいときに使います。たとえば `./study peek app/internal/shortener/shortener.go` です。
 
 ## クイズ
 

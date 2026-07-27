@@ -8,8 +8,19 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 6 の演習を用意します。
+
+```bash
+./study start 6
+```
+
+`work/` に、実装する関数が `panic("TODO: ...")` になった Go コードと、TODO コメントだけが入った `deploy/compose.yaml` が用意されます。
+まず `./study test` を実行し、未実装のためテストが落ちることを確認してから、TODO を一つずつ埋めていきましょう。
+
 :::note[このページのコードについて]
-このページは Day 6 時点のコードを解説しています。当時のコードは `git checkout day06` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 6 時点のコードを解説しています。`./study start 6` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -21,7 +32,24 @@ import Quiz from '../../components/Quiz.astro';
 - named volume によって、コンテナを再起動しても Postgres のデータが残る理由を説明できるようになる。
 - `pgxpool` が PostgreSQL 接続を使い回すコネクションプールだと理解する。
 - `STORAGE`、`DATABASE_URL`、`TEST_DATABASE_URL` のような環境変数ベース設定を、12-factor app の考え方と結びつけて読めるようになる。
-- `cd deploy && docker compose up -d --build` でアプリと Postgres を起動し、再起動後もデータが残ることを確認する。
+- `cd work/deploy && docker compose up -d --build` でアプリと Postgres を起動し、再起動後もデータが残ることを確認する。
+
+## 今日つくるもの
+
+- `work/app/internal/storage/postgres.go` に `PostgresStore` と次の関数・メソッドを実装します。
+  - `NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, error)`
+  - `(s *PostgresStore) init(ctx context.Context) error`
+  - `(s *PostgresStore) Close()`
+  - `(s *PostgresStore) Save(ctx context.Context, code, url string) error`
+  - `(s *PostgresStore) Load(ctx context.Context, code string) (string, error)`
+  - `(s *PostgresStore) Get(ctx context.Context, code string) (Link, error)`
+  - `(s *PostgresStore) IncrementClicks(ctx context.Context, code string) error`
+- `Save` は code と URL を保存し、同じ code が再度渡されたときは URL を上書きします。`Load` は URL、`Get` は code・URL・クリック数を返し、`IncrementClicks` はクリック数を 1 増やします。
+- 存在しない code を `Load`、`Get`、`IncrementClicks` に渡した場合は `ErrNotFound` として扱います。接続、初期化、SQL 実行の失敗は隠さず `error` として呼び出し元へ返し、初期化に失敗した接続プールは閉じます。
+- `work/app/cmd/server/main.go` の `newStore() (storage.Storage, func())` を拡張します。`STORAGE=postgres` なら `DATABASE_URL` を使って Postgres を選び、URL が未設定の場合や初期化に失敗した場合はサーバを起動させません。終了時には接続プールを閉じます。
+- `work/deploy/compose.yaml` を作ります。`app` と `postgres` を定義し、アプリには `STORAGE=postgres` と接続 URL を渡します。Postgres には初期設定、healthcheck、データを残す named volume を設定し、`app` は Postgres が Healthy になってから起動する構成にします。
+- HTTP API の契約は変えません。`GET /healthz` は `ok`、`POST /api/links` は短縮コードと URL、`GET /{code}` は保存先への `302 Found` を返せる状態を保ちます。
+- 合格条件は、TODO が残っておらず、Go の build・vet・test が通ること、pgx で Postgres に接続して `STORAGE` で保存先を切り替えられること、`compose.yaml` が有効な YAML で Postgres、healthcheck、Healthy 待ち、volume を定義していることです。
 
 ## 解説
 
@@ -67,10 +95,15 @@ Compose では、どのサービスを起動するか、どのイメージを使
 
 今回の定義は `deploy/compose.yaml` です。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```yaml title="deploy/compose.yaml"
 services:
   app:
     build:
+      # Run from deploy/ with: docker compose up --build
+      # The Day 5 Dockerfile expects app/ as its build context.
       context: ../app
       dockerfile: ../deploy/Dockerfile
     ports:
@@ -84,10 +117,18 @@ services:
 
   postgres:
     image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: shortlink
+      POSTGRES_PASSWORD: shortlink
+      POSTGRES_DB: shortlink
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U shortlink -d shortlink"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
 volumes:
   postgres-data:
@@ -98,6 +139,8 @@ Compose の良さは、実行環境がファイルとして読めることです
 「アプリは 8080 番を公開する」
 「Postgres のデータは named volume に置く」
 という構成が、コマンド履歴ではなくリポジトリ内の YAML に残ります。
+
+</details>
 
 ### サービス名 DNS によるディスカバリ
 
@@ -166,23 +209,44 @@ volumes:
 アプリ側の Postgres 実装は `app/internal/storage/postgres.go` にあります。
 ここでは `github.com/jackc/pgx/v5/pgxpool` を使っています。
 
+`PostgresStore` は、Postgres への接続プールを保持します。
+
 ```go title="app/internal/storage/postgres.go"
 type PostgresStore struct {
 	pool *pgxpool.Pool
 }
+```
 
+`NewPostgresStore` の契約は、接続プールを作って必要なテーブルを初期化し、利用可能なストアを返すことです。
+
+```go title="app/internal/storage/postgres.go"
+func NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, error) {
+```
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
+```go title="app/internal/storage/postgres.go"
 func NewPostgresStore(ctx context.Context, databaseURL string) (*PostgresStore, error) {
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres pool: %w", err)
 	}
-	// init(ctx) で CREATE TABLE IF NOT EXISTS を実行する
+
+	store := &PostgresStore{pool: pool}
+	if err := store.init(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return store, nil
 }
 ```
 
 `pgxpool.Pool` は PostgreSQL 接続のプールです。
 HTTP リクエストのたびに TCP 接続を作り直すと遅くなり、接続数も増えすぎます。
 コネクションプールは接続を再利用し、同時アクセス時の DB 接続を管理しやすくします。
+
+</details>
 
 起動時には、必要なテーブルを作ります。
 
@@ -217,17 +281,50 @@ UPDATE links SET clicks = clicks + 1 WHERE code = $1;
 `cmd/server/main.go` では、環境変数 `STORAGE` によって保存先を切り替えています。
 
 ```go title="app/cmd/server/main.go"
-switch os.Getenv("STORAGE") {
-case "", "memory":
-	return storage.NewMemoryStore(), func() {}
-case "sqlite":
-	// SQLITE_PATH がなければ data.db
-case "postgres":
-	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		log.Fatal("DATABASE_URL is required when STORAGE=postgres")
+func newStore() (storage.Storage, func()) {
+	switch os.Getenv("STORAGE") {
+```
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
+```go title="app/cmd/server/main.go"
+func newStore() (storage.Storage, func()) {
+	switch os.Getenv("STORAGE") {
+	case "", "memory":
+		return storage.NewMemoryStore(), func() {}
+	case "sqlite":
+		path := os.Getenv("SQLITE_PATH")
+		if path == "" {
+			path = "data.db"
+		}
+
+		store, err := storage.NewSQLiteStore(context.Background(), path)
+		if err != nil {
+			log.Fatalf("initialize sqlite storage: %v", err)
+		}
+		return store, func() {
+			if err := store.Close(); err != nil {
+				log.Printf("close sqlite storage: %v", err)
+			}
+		}
+	case "postgres":
+		databaseURL := os.Getenv("DATABASE_URL")
+		if databaseURL == "" {
+			log.Fatal("DATABASE_URL is required when STORAGE=postgres")
+		}
+
+		store, err := storage.NewPostgresStore(context.Background(), databaseURL)
+		if err != nil {
+			log.Fatalf("initialize postgres storage: %v", err)
+		}
+		return store, func() {
+			store.Close()
+		}
+	default:
+		log.Fatalf("unsupported STORAGE %q; want memory, sqlite, or postgres", os.Getenv("STORAGE"))
+		return nil, func() {}
 	}
-	store, err := storage.NewPostgresStore(context.Background(), databaseURL)
 }
 ```
 
@@ -237,6 +334,8 @@ case "postgres":
 
 12-factor app では、接続先、ポート番号、認証情報のように環境ごとに変わるものを、ソースコードに埋め込まないようにします。
 同じアプリイメージを使い、環境変数で開発、CI、本番の振る舞いを変えるためです。
+
+</details>
 
 ### skip 可能な Postgres 統合テスト
 
@@ -260,30 +359,41 @@ if databaseURL == "" {
 
 ## 手を動かす
 
-ここでは、Compose で Postgres とアプリを起動します。
-Day 5 と違い、リポジトリルートではなく `deploy/` に移動してから実行します。
+### 1. TODO を実装する
 
-まず、アプリと Postgres をビルドして起動します。
+`work/app/internal/storage/postgres.go`、`work/app/cmd/server/main.go`、`work/deploy/compose.yaml` の TODO を実装します。
+まず `./study todo` で残っている箇所を確認し、上の「今日つくるもの」にある振る舞いを一つずつ満たしてください。
+完成コードを写すのではなく、先にテストと既存の `Storage` インターフェースを読んで、必要な処理を考えてみましょう。
 
-```sh
-cd deploy
-docker compose up -d --build
+### 2. `./study test` で確かめる
+
+リポジトリのルートで合格条件を確認します。
+
+```bash
+./study test
 ```
 
-期待出力は、Postgres が Healthy になってから app が Started になる形です。
-Docker Compose のバージョンにより細部は変わりますが、検証済みの実挙動では次の順序が見えます。
+すべて実装できると、TODO、Go コード、Compose の構成に緑のチェックが付き、最後に次のメッセージが表示されます。
 
 ```txt
-[+] Running 4/4
- ✔ Network deploy_default          Created
- ✔ Volume "deploy_postgres-data"   Created
- ✔ Container deploy-postgres-1     Healthy
- ✔ Container deploy-app-1          Started
+✅ Day06 の合格条件を満たしています
 ```
 
-ヘルスチェックします。
+失敗した項目があれば、その項目だけを直してもう一度実行してください。
+Postgres 統合テストは `TEST_DATABASE_URL` が未設定なら skip されますが、`./study test` は Go の build・vet に加えて Compose の構成も検査します。
 
-```sh
+### 3. `./study run` で API を実際に叩く
+
+まず、自分が実装したコードで HTTP API の契約が壊れていないことを確認します。
+リポジトリのルートでサーバを起動してください。環境変数を指定しないため、この確認ではメモリ保存を使います。
+
+```bash
+./study run
+```
+
+サーバを起動したまま、別のターミナルからヘルスチェックします。
+
+```bash
 curl http://localhost:8080/healthz
 ```
 
@@ -295,7 +405,7 @@ ok
 
 短縮 URL を 1 つ作ります。
 
-```sh
+```bash
 curl -s -X POST http://localhost:8080/api/links \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com/day6"}'
@@ -310,7 +420,7 @@ curl -s -X POST http://localhost:8080/api/links \
 
 リダイレクトを確認します。
 
-```sh
+```bash
 curl -i http://localhost:8080/1
 ```
 
@@ -321,10 +431,48 @@ HTTP/1.1 302 Found
 Location: https://example.com/day6
 ```
 
+確認できたら、`./study run` を実行しているターミナルで <kbd>Ctrl</kbd> + <kbd>C</kbd> を押して停止します。
+
+### 4. Compose で Postgres への保存を確かめる
+
+次は、実装した Compose 構成で Postgres とアプリを起動します。
+演習の成果物は `work/` にあるため、`work/deploy/` に移動して実行します。
+
+```bash
+cd work/deploy
+docker compose up -d --build
+```
+
+期待出力は、Postgres が Healthy になってから app が Started になる形です。
+Docker Compose のバージョンにより細部は変わりますが、検証済みの実挙動では次の順序が見えます。
+
+```txt
+[+] Running 4/4
+ ✔ Network deploy_default          Created
+ ✔ Volume "deploy_postgres-data"   Created
+ ✔ Container deploy-postgres-1     Healthy
+ ✔ Container deploy-app-1          Started
+```
+
+Compose で起動したアプリにも短縮 URL を 1 つ作ります。
+
+```bash
+curl -s -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/day6"}'
+```
+
+期待出力は次のような JSON です。
+最初の作成なら `code` は `1` になります。
+
+```json
+{"code":"1","short_url":"http://localhost:8080/1"}
+```
+
 ここで、アプリコンテナだけを再起動します。
 Postgres コンテナと named volume は残したままです。
 
-```sh
+```bash
 docker compose restart app
 ```
 
@@ -337,7 +485,7 @@ docker compose restart app
 
 再起動後、同じコードをもう一度確認します。
 
-```sh
+```bash
 curl -i http://localhost:8080/1
 ```
 
@@ -352,7 +500,7 @@ Location: https://example.com/day6
 最後に片付けます。
 演習データを残さないため、ここでは `-v` を付けて named volume も削除します。
 
-```sh
+```bash
 docker compose down -v
 ```
 
@@ -370,6 +518,13 @@ docker compose down -v
 今日の確認で使った `code=1` は消えています。
 再起動では残り、volume 削除では消える。
 この違いを体で覚えておきましょう。
+
+## 詰まったら
+
+- `./study hint`：考え方や背景を読み直したいときに使います。まずはここから試しましょう。
+- `./study todo`：未実装の関数やファイルを一覧し、次に取り組む場所を確認します。
+- `./study answer`：自分の実装と模範解答の差分をまとめて確認します。自分で書いたあとに比べるのがおすすめです。
+- `./study peek <パス>`：指定した 1 ファイルの模範解答をそのまま表示します。どうしても進めない箇所に絞って使いましょう。
 
 ## クイズ
 

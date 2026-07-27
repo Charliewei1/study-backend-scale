@@ -8,8 +8,22 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 14 の演習を始めます。
+
+```bash
+./study start 14
+```
+
+`work/` に、実装する関数が `panic("TODO: ...")` になった Go コードが用意されます。まずは何も直さずに次を実行し、テストが落ちることを確認してから始めましょう。
+
+```bash
+./study test
+```
+
 :::note[このページのコードについて]
-このページは Day 14 時点のコードを解説しています。当時のコードは `git checkout day14` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 14 時点のコードを解説しています。`./study start 14` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -20,6 +34,25 @@ import Quiz from '../../components/Quiz.astro';
 - `hash(key) % N` の問題と、consistent hashing のリング、時計回りの割り当て、仮想ノードを説明できるようになる。
 - `app/internal/cluster/hashring.go` の `sort.Search`、ハッシュ選定、再配置率、標準偏差のテストを読めるようになる。
 - CAP 定理、CDN/エッジ、世界規模の shortlink 設計を URL 短縮サービスに対応づけられるようになる。
+
+## 今日つくるもの
+
+- `app/internal/cluster/hashring.go`
+  - `NewHashRing(replicas int) *HashRing` は、指定された数の仮想ノードを使う空のリングを返す。`replicas` が 0 以下なら 1 として扱う。
+  - `(*HashRing).AddNode(node string)` は、実ノードとその仮想ノードを追加する。空のノード名と、すでにあるノード名はリングを変えずに扱う。
+  - `(*HashRing).RemoveNode(node string)` は、実ノードと対応する仮想ノードをすべて削除する。存在しないノード名では何も変更しない。
+  - `(*HashRing).GetNode(key string) (node string, ok bool)` は、key を担当する実ノードを決定的に返す。リングが空なら `("", false)`、ノードがあれば担当ノードと `true` を返す。
+  - `(*HashRing).sortPoints()`、`virtualNodeKey(node string, replica int) string`、`hashKey(key string) uint64` は、仮想ノードを区別でき、リング上の点を安定した順序で探索できる状態を保つ。ハッシュは同じ入力に同じ値を返し、key と node を十分に分散させる。
+  - 公開メソッドは並行利用できること。追加・削除中の読み取りでも内部の map や slice を壊さず、ノードがあるリングで `GetNode` が失敗しないこと。
+- HashRing が満たす契約
+  - 同じ key は、リングが変わらない限り同じ node に割り当てられること。
+  - ノード追加時は大半の key を元の node に残し、10 台から 11 台へ増やしたときの移動率が約 `1/11` になること。
+  - ノード削除時は、そのノードが担当していなかった key の割り当てを変えないこと。
+  - 仮想ノードを 1 から 200 に増やすと、10 台への割り当ての標準偏差が明確に小さくなること。
+  - Day 14 ではサーバ本体や HTTP API の契約は変更せず、HashRing は将来 Redis や DB の shard 選択に使える独立したライブラリとして仕上げること。
+- 合格条件
+  - `./study todo` で未実装が残らず、`./study test` の build、vet、race detector 付きテストがすべて通ること。
+  - `./study run` で既存の URL 短縮 API が起動し、リクエストへこれまでどおり応答すること。
 
 ## 解説
 
@@ -204,6 +237,9 @@ type ringPoint struct {
 
 `AddNode` は実ノード名から仮想ノード名を作り、それぞれをハッシュして `points` に追加します。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/cluster/hashring.go"
 func (r *HashRing) AddNode(node string) {
 	if node == "" {
@@ -230,7 +266,12 @@ func (r *HashRing) AddNode(node string) {
 
 `virtualNodeKey` は `node + "#" + replica` です。`node-a#0`、`node-a#1` のような文字列を別々にハッシュすることで、同じ実ノードがリング上の複数地点に置かれます。
 
+</details>
+
 `GetNode` は key のハッシュ値を求め、`points` の中から「そのハッシュ以上の最初の点」を探します。`points` はハッシュ順にソート済みなので、ここで `sort.Search` が使えます。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```go title="app/internal/cluster/hashring.go"
 func (r *HashRing) GetNode(key string) (node string, ok bool) {
@@ -254,6 +295,8 @@ func (r *HashRing) GetNode(key string) (node string, ok bool) {
 ```
 
 `sort.Search` は条件が false から true に切り替わる最初の位置を返します。ここでは `r.points[i].hash >= h` が初めて true になる場所です。見つからず末尾を超えたら、リングを一周して先頭の点へ戻すため `idx = 0` にします。`GetNode` は `points` を読み取るだけなので、複数の読み取りは `RLock` で同時に進められます。
+
+</details>
 
 `RemoveNode` は、その実ノードに対応する点を `points` から除きます。削除されたノードが持っていた範囲の key は、時計回りで次の node へ移ります。それ以外の key は動きません。
 
@@ -372,10 +415,33 @@ DB も同じく code 空間で分けられます。短縮 code が十分ラン�
 
 ## 手を動かす
 
-今日はアプリ本体を起動しなくても確認できます。`app` ディレクトリで、`cluster` パッケージのテストを race detector 付きで実行します。
+### 1. HashRing を実装する
+
+`work/app/internal/cluster/hashring.go` を開き、`panic("TODO: ...")` になっている関数を実装します。最初から模範解答に合わせるのではなく、`work/app/internal/cluster/hashring_test.go` を仕様書として読み、まず次の順序で小さく進めてみてください。
+
+1. 空のリングを作り、ノードを追加・削除できるようにする。
+2. key のハッシュ位置から、時計回りで最初の仮想ノードを探せるようにする。
+3. 同じ key の割り当てが安定することと、リング末尾から先頭へ戻れることを確かめる。
+4. 最後にロックを見直し、追加と読み取りが同時に走っても安全にする。
+
+残っている実装箇所は、いつでも次のコマンドで確認できます。
+
+```bash
+./study todo
+```
+
+### 2. `./study test` で確かめる
+
+実装したらリポジトリのルートへ戻り、合格条件をまとめて実行します。
+
+```bash
+./study test
+```
+
+このコマンドは TODO の残り、`go build ./...`、`go vet ./...`、race detector 付きの全テストを確認します。HashRing だけを詳しく調べたいときは、次のコマンドも使えます。
 
 ```bash title="HashRing のテストを実行"
-cd app
+cd work/app
 go test -race ./internal/cluster/... -v
 ```
 
@@ -415,6 +481,54 @@ stddev with many replicas = 900.00, with one replica = 1000.00; want many replic
 最後に、テストの helper も追ってください。`assignments` は各 key の担当 node を map に保存します。`movedCount` は before と after を比べて移動数を数えます。`assignmentStddev` は期待する node 一覧を受け取り、0 件の node も含めて標準偏差を計算します。あわせて、全 node に割り当てがあることも検証します。
 
 `TestHashRingConcurrentAddAndGet` は、ノード追加と `GetNode` を同時に走らせます。`AddNode` と `RemoveNode` は `points` を変更するため排他ロックを取り、`GetNode` は読み取りだけなので `RLock` で守ります。race detector 付きで通ることにより、並行アクセス時にリング内部の map や slice を壊していないことを確認できます。
+
+### 3. `./study run` で実際に叩く
+
+HashRing はまだサーバ本体へ組み込まないため、ここでは新しい shard 選択 API は増えません。テストが通ったあとに既存の URL 短縮 API を起動し、独立したライブラリの追加でアプリを壊していないことまで確認しましょう。
+
+```bash title="ターミナル1: サーバを起動"
+./study run
+```
+
+別のターミナルから、まず liveness endpoint を叩きます。
+
+```bash title="ターミナル2: 起動を確認"
+curl -i http://localhost:8080/healthz
+```
+
+```txt title="期待出力例"
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+...
+
+ok
+```
+
+続いて短縮 URL を 1 件作ります。
+
+```bash title="ターミナル2: URL を短縮"
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com"}'
+```
+
+```txt title="期待出力例"
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: http://localhost:8080/...
+...
+
+{"code":"...","short_url":"http://localhost:8080/..."}
+```
+
+確認できたら、サーバは `Ctrl-C` で停止します。
+
+## 詰まったら
+
+- `./study hint`：consistent hashing、仮想ノード、`sort.Search` の考え方をもう一度確認したいときに、この日の解説を開きます。
+- `./study todo`：`work/` に残っている未実装の関数を一覧します。
+- `./study answer`：自分の実装と Day 14 の模範解答を差分で比べます。まず自分で書いてから使いましょう。
+- `./study peek <パス>`：どうしても進めない 1 ファイルだけ、模範解答をそのまま確認します。たとえば `./study peek app/internal/cluster/hashring.go` です。
 
 ## クイズ
 

@@ -257,7 +257,8 @@ write_work_docs() {
 		echo '---'
 		echo
 		if [ -f "$ROOT/docs/src/content/docs/day$day.mdx" ]; then
-			sed -e 's/^import Quiz.*$//' "$ROOT/docs/src/content/docs/day$day.mdx"
+			# JSXやStarlight記法のままだとターミナルで読みにくいので素のMarkdownへ落とす
+			python3 "$CHECKS/mdx2text.py" <"$ROOT/docs/src/content/docs/day$day.mdx"
 		fi
 	} >"$WORK/HINTS.md"
 }

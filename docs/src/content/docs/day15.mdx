@@ -8,8 +8,26 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 15 の演習を始めます。
+
+```bash
+./study start 15
+```
+
+`work/` に、今日作る Kubernetes マニフェストと負荷試験スクリプトの骨組みが置かれます。TODO コメントが残っているファイルを、これから自分で完成させていきます。
+
+まずは何も直さずに、テストが落ちることを確認してください。
+
+```bash
+./study test
+```
+
+失敗内容が、そのまま今日の実装チェックリストになります。ひとつずつ TODO を埋め、同じコマンドで確かめながら進めましょう。
+
 :::note[このページのコードについて]
-このページは Day 15 時点のコードを解説しています。当時のコードは `git checkout day15` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 15 時点のコードを解説しています。`./study start 15` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -20,6 +38,32 @@ import Quiz from '../../components/Quiz.astro';
 - Day 7、Day 8、Day 15 の同一負荷計測を比較し、ローカル環境の数値を誠実に読めるようになる。
 - スケーラビリティを「負荷に比例してリソースを足せば性能が維持できる性質」として再定義できるようになる。
 - この教材の次に学ぶべき領域を、自分の関心に合わせて選べるようになる。
+
+## 今日つくるもの
+
+Day 15 で新しく Go の関数を実装する課題はありません。Day 14 までに育てたアプリを最終構成で動かすため、次のファイルを作ります。
+
+- `deploy/k8s/full/00-namespace.yaml`: `shortlink-full` Namespace を作り、既存の `shortlink` Namespace と分離する。
+- `deploy/k8s/full/01-configmap.yaml`: app をポート `8080`、Postgres 保存、`redis:6379` のキャッシュ、JSON ログ、5 秒のリクエストタイムアウトで動かす設定を渡す。最終計測を 429 で歪めないよう、レートリミットは有効にしない。
+- `deploy/k8s/full/02-secret.yaml`: app の `DATABASE_URL` と Postgres のパスワードを、教材用の Secret として渡す。
+- `deploy/k8s/full/03-postgres-pvc.yaml`: Postgres のデータ用に、`ReadWriteOnce`、1Gi の PVC を要求する。
+- `deploy/k8s/full/04-postgres-deployment.yaml`: Postgres 16 を 1 Pod で起動し、PVC を使う。readiness/liveness probe、resources を持ち、更新時に同じ PVC を使う Pod を二重起動しない。
+- `deploy/k8s/full/05-postgres-service.yaml`: app から `postgres:5432` で接続できる ClusterIP Service を作る。
+- `deploy/k8s/full/06-redis-deployment.yaml`: Redis 7 をキャッシュとして 1 Pod で起動する。永続化せず、readiness/liveness probe と resources を持たせる。
+- `deploy/k8s/full/07-redis-service.yaml`: app から `redis:6379` で接続できる ClusterIP Service を作る。
+- `deploy/k8s/full/08-app-deployment.yaml`: app を 2 replicas で起動し、Postgres の準備を待ってから開始する。ConfigMap と Secret を読み、`/healthz` と `/readyz` の probe、CPU・メモリの requests/limits、停止なしで更新する RollingUpdate を設定する。
+- `deploy/k8s/full/09-app-service.yaml`: ready な app Pod を、クラスタ内の port 80 で公開する。
+- `deploy/k8s/full/10-hpa.yaml`: app Deployment を対象に、CPU 平均利用率 70% を目標として 2〜10 replicas の範囲で増減させる。
+- `deploy/k8s/full/README.md`: kind でのクラスタ作成、イメージの読み込み、適用、動作確認、負荷試験、後片付けの手順を残す。
+- `load/day15-final.js`: Day 7 と同じ 2 分間の負荷条件と thresholds を使い、90% のリダイレクトと 10% の作成リクエストを流す。
+
+満たすべき外部契約も確認しておきましょう。
+
+- `GET /healthz` は外部依存を確認せず `200` と `ok`、`GET /readyz` は Postgres に接続できるときだけ `200` と `ok` を返す。接続できないときは `503` とし、その Pod にトラフィックを流さない。
+- `POST /api/links` は `{"url":"https://example.com"}` を受け取り、成功時は `201 Created`、`Location` ヘッダー、`code` と `short_url` を含む JSON を返す。不正な入力は `400` の JSON エラー、保存先の予期しない障害は `500` の JSON エラーとして扱う。
+- `GET /{code}` は保存済みなら `302 Found` と元 URL の `Location`、存在しない code なら `404` の JSON エラーを返す。
+- Redis は補助キャッシュとして扱い、消えたり接続できなかったりしても Postgres から読み取れる構成にする。
+- `./study test` で、全 YAML がマニフェストとして読めること、Postgres・Redis・HPA・PVC が含まれること、負荷試験に thresholds があること、Go の build・vet・test が通ることを確認できれば合格。
 
 ## 解説
 
@@ -158,8 +202,83 @@ Day 10 の resources と Day 11 の HPA がここでつながります。
 
 ## 手を動かす
 
-ここでは `deploy/k8s/full/README.md` に沿って、kind に最終構成を適用します。
-リポジトリルートから実行してください。
+ここからは、`work/` の骨組みを自分で完成させます。すべてリポジトリルートから進めてください。
+
+### 1. 最終構成を実装する
+
+まず、残っている TODO を確認します。
+
+```bash
+./study todo
+```
+
+`work/deploy/k8s/full/` は、ファイル名の順に取り組むと依存関係を追いやすくなります。
+
+1. Namespace、ConfigMap、Secret を作る。
+2. Postgres の PVC、Deployment、Service を作る。
+3. Redis の Deployment、Service を作る。
+4. app の Deployment、Service、HPA を作る。
+5. `README.md` に実行手順をまとめる。
+6. `load/day15-final.js` に Day 7 と比較できる負荷条件と合格基準を書く。
+
+先ほどの「今日つくるもの」を仕様として使い、まずは模範解答を見ずに書いてみてください。ひと区切りごとに `./study todo` を実行すると、TODO コメントの消し忘れを見つけやすくなります。
+
+### 2. `./study test` で確かめる
+
+実装できたら、合格条件をまとめて確認します。
+
+```bash
+./study test
+```
+
+YAML の構文だけでなく、Postgres、Redis、HPA、PVC が最終構成に含まれていること、k6 の thresholds、既存 Go コードの build・vet・test まで確認されます。失敗した項目があれば、対応するファイルへ戻って直し、すべてにチェックが付くまで繰り返しましょう。
+
+### 3. `./study run` で API を実際に叩く
+
+Kubernetes へ載せる前に、Day 14 までに作ったサーバの API 契約を手元で確かめます。
+
+```bash
+./study run
+```
+
+サーバはそのまま起動しておき、別のターミナルから短縮 URL を作ります。
+
+```bash
+curl -i -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com"}'
+```
+
+期待する応答の形です。
+
+```txt
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: http://localhost:8080/<code>
+
+{"code":"<code>","short_url":"http://localhost:8080/<code>"}
+```
+
+返ってきた `code` を使い、リダイレクトを追わずに応答を確認します。
+
+```bash
+curl -i http://localhost:8080/<code>
+```
+
+```txt
+HTTP/1.1 302 Found
+Location: https://example.com
+```
+
+確認できたら、`./study run` を実行しているターミナルで `Ctrl-C` を押してサーバを止めます。
+
+### 4. kind で最終構成を動かす
+
+ここからは、自分で書いた `work/deploy/k8s/full/README.md` の手順と照らし合わせながら、kind に最終構成を適用します。以降のパスはすべて `work/` の中を指すため、先に移動してください。
+
+```bash
+cd work
+```
 
 まず kind クラスタを用意します。
 既存の `shortlink` クラスタを使っても構いません。
@@ -402,6 +521,13 @@ Day 14 の分散理論は、単一 DB の先を考える道具です。
 
 Day 15 の全部載せは、それらを 1 つの絵に戻す日です。
 スケーラビリティは単一の技術名ではなく、設計、実装、デプロイ、計測、運用判断の組み合わせです。
+
+## 詰まったら
+
+- `./study hint`: 今日の考え方と、満たすべき仕様を読み直したいときに使います。
+- `./study todo`: TODO が残っているファイルを一覧し、次に取り組む場所を確認します。
+- `./study answer`: 自分の実装と模範解答の差分をまとめて確認します。まず自分で書いたあとに使いましょう。
+- `./study peek <パス>`: どうしても進めない 1 ファイルだけ、模範解答をそのまま確認します。たとえば `./study peek deploy/k8s/full/10-hpa.yaml` のように指定します。
 
 ## クイズ
 

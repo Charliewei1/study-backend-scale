@@ -8,8 +8,19 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 9 の演習を始めます。
+
+```bash
+./study start 9
+```
+
+`work/` に、これから作る Kubernetes マニフェストなどの骨組みが用意されます。
+中身は TODO コメントだけなので、まずは何も実装せずに `./study test` を実行し、テストが落ちることを確認してから始めましょう。
+
 :::note[このページのコードについて]
-このページは Day 9 時点のコードを解説しています。当時のコードは `git checkout day09` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 9 時点のコードを解説しています。`./study start 9` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -21,6 +32,32 @@ import Quiz from '../../components/Quiz.astro';
 - `kubectl get`、`describe`、`logs`、`exec` の基本動詞を使えるようになる。
 - `kind load docker-image` が必要な理由を説明できるようになる。
 - Pod を 1 つ削除しても Deployment が自己修復する様子を観察できるようになる。
+
+## 今日つくるもの
+
+今日は関数を実装するのではなく、`work/` に次のファイルを作ります。ここでは実装内容ではなく、満たすべき振る舞いだけを確認しておきましょう。
+
+- `deploy/kind-config.yaml`
+  - kind のクラスタ設定として読み取れ、1 台の `control-plane` ノードを持つこと。
+- `deploy/k8s/base/00-namespace.yaml`
+  - `shortlink` という Namespace を定義し、アプリ名と教材全体を識別できるラベルを持つこと。
+- `deploy/k8s/base/deployment.yaml`
+  - `shortlink` Namespace に shortlink API の Pod を 2 つ起動し、その数を保つこと。
+  - Deployment の selector と Pod の labels が一致すること。
+  - kind に読み込んだ `shortlink:dev` イメージを外部から pull せずに使い、`STORAGE=memory`、コンテナの HTTP ポート `8080` で動くこと。
+- `deploy/k8s/base/service.yaml`
+  - `shortlink` Namespace に ClusterIP Service を作り、ラベルが一致する shortlink Pod を転送先にすること。
+  - Service のポート `80` で受けた通信を、Pod のポート `8080` へ転送すること。
+- `deploy/k8s/README.md`
+  - クラスタ作成、イメージのビルドと読み込み、マニフェスト適用、動作確認、後片付けの手順を、実行するディレクトリが分かる形で説明すること。
+- API の契約
+  - Service を port-forward した状態で `GET /healthz` が `ok` を返すこと。
+  - `POST /api/links` が短縮リンクを作って `201 Created` を返し、返された code への `GET /{code}` が保存先 URL への `302 Found` を返すこと。
+  - 不正な JSON や空・不正な URL は `400 Bad Request`、存在しない code は `404 Not Found`、保存先の予期しないエラーは `500 Internal Server Error` として扱うこと。
+  - Day 9 はメモリ保存のため、別の Pod に保存されていない code を問い合わせた場合は `404` になり得ること。この制約は隠さず、複数 Pod で観察します。
+- 合格条件
+  - `./study test` で、YAML の構文、Namespace・Deployment・Service、2 つ以上の replicas、label selector の条件をすべて満たすこと。
+  - `./study test --full` で、イメージを kind に読み込み、マニフェストを apply でき、Pod が Ready になること。構文エラー、apply の失敗、Pod の起動失敗は合格にしません。
 
 ## 解説
 
@@ -73,11 +110,14 @@ deploy/k8s/base/
 ```
 
 最新のリポジトリでは、Day 10 で扱う ConfigMap、Secret、probe のマニフェストも `base/` に追加されます。
-Day 9 時点の構成だけを見たい場合は `git checkout day09` で確認してください。
+Day 9 時点のファイルは `./study start 9` で `work/` に用意され、模範解答は `./study peek deploy/k8s/base/<ファイル名>` で確認できます。
 
 `00-namespace.yaml` は Namespace を作ります。
 Namespace は、クラスタ内のリソースを論理的に分ける単位です。
 今回の Deployment と Service は `shortlink` Namespace に置きます。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```yaml title="deploy/k8s/base/00-namespace.yaml"
 apiVersion: v1
@@ -93,6 +133,8 @@ metadata:
 `kubectl apply -f k8s/base` のようにディレクトリをまとめて適用するとき、ファイル名の順で処理されます。
 Namespace が先に作られていないと、その Namespace に置く Deployment や Service の作成に失敗します。
 そこで `00-` を付けて、Namespace が先に適用されやすい名前にしています。
+
+</details>
 
 ### Deployment は Pod 数を保つ宣言
 
@@ -238,54 +280,46 @@ kubectl exec -n shortlink "$POD_NAME" -- /bin/sh
 
 ## 手を動かす
 
-ここからは、実際に検証した流れに沿って進めます。
-最初はリポジトリルートから実行します。
+ここからは、`work/` の TODO を自分で実装し、テストと実行結果を順番に確かめます。
+コマンドはリポジトリのルートから実行してください。
 
-```sh
-kind create cluster --config deploy/kind-config.yaml --name shortlink
-docker build -f deploy/Dockerfile -t shortlink:dev app
-kind load docker-image shortlink:dev --name shortlink
+### 1. マニフェストを実装する
+
+まず `./study todo` で、今日作るファイルを確認します。
+
+```bash
+./study todo
 ```
 
-最初のコマンドで kind クラスタを作ります。
-次に shortlink イメージをビルドし、`kind load docker-image` で kind クラスタ内のノードから見えるようにします。
-`Deployment` は `imagePullPolicy: Never` なので、この読み込みを忘れると Pod は `shortlink:dev` を見つけられません。
+`work/deploy/kind-config.yaml`、`work/deploy/k8s/base/` の 3 つのマニフェスト、`work/deploy/k8s/README.md` を編集します。
+先ほど確認した契約を満たすように、TODO を埋めてください。
 
-マニフェストは `deploy/` ディレクトリから適用します。
+selector と labels は、一文字でも違うと Deployment や Service が Pod を見つけられません。
+どのリソースがどのラベルでつながるかを意識して書きましょう。
 
-```sh
-cd deploy
-kubectl apply -f k8s/base
+### 2. `./study test` で確かめる
+
+実装できたら、軽量なテストを実行します。
+
+```bash
+./study test
 ```
 
-`namespace/shortlink created`、`deployment.apps/shortlink created`、`service/shortlink created` が出れば適用できています。
+YAML の構文に加え、Namespace、Deployment、Service、2 つ以上の replicas、label selector が揃っているかが確認されます。
+失敗した項目があれば、そのメッセージを手がかりにマニフェストを直し、もう一度実行してください。
 
-作成されたリソースを確認します。
+### 3. `./study run` で API を実際に叩く
 
-```sh
-kubectl get deploy,rs,pod,svc -n shortlink
+マニフェストの静的な条件を満たしたら、まずアプリの API 契約を確かめます。
+次のコマンドで `work/app` のサーバを起動し、このターミナルはそのままにします。
+
+```bash
+./study run
 ```
 
-期待出力の形です。Pod 名の末尾や ClusterIP は環境ごとに変わります。
+別のターミナルから health check を送ります。
 
-```txt
-deployment.apps/shortlink          2/2
-pod/shortlink-xxxxxxxxx-aaaaa      1/1   Running
-pod/shortlink-xxxxxxxxx-bbbbb      1/1   Running
-service/shortlink                  ClusterIP   80/TCP
-```
-
-ここで見るべきなのは、Deployment が `2/2`、Pod が 2 つとも `Running` になっていることです。
-これで `replicas: 2` の望ましい状態が満たされています。
-
-ローカルから Service へ接続するため、port-forward を起動します。
-このコマンドは実行中のままにし、別ターミナルで curl します。
-
-```sh
-kubectl port-forward svc/shortlink 8080:80 -n shortlink
-```
-
-```sh
+```bash
 curl http://localhost:8080/healthz
 ```
 
@@ -297,7 +331,7 @@ ok
 
 短縮リンクを作ります。
 
-```sh
+```bash
 curl -i -X POST http://localhost:8080/api/links \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com/day09/kubernetes"}'
@@ -311,10 +345,9 @@ HTTP/1.1 201 Created
 ```
 
 以下では code が `1` だったとして進めます。別の code が返った場合は置き換えてください。
-
 リダイレクトを確認します。
 
-```sh
+```bash
 curl -i http://localhost:8080/1
 ```
 
@@ -325,19 +358,56 @@ HTTP/1.1 302 Found
 Location: https://example.com/day09/kubernetes
 ```
 
+確認できたら、`./study run` を実行しているターミナルで `Ctrl-C` を押して止めます。
+
+### 4. kind 上で確かめる
+
+最後に重いテストを実行し、自分のマニフェストを実際の kind クラスタへ載せます。
+
+```bash
+./study test --full
+```
+
+このテストは Docker イメージのビルドと kind への読み込み、マニフェストの apply、Pod の Ready 確認まで行うため、数分かかることがあります。
+`Deployment` は `imagePullPolicy: Never` なので、イメージの読み込みに失敗すると Pod は `shortlink:dev` を見つけられません。
+
+作成されたリソースを確認します。
+
+```bash
+kubectl get deploy,rs,pod,svc -n shortlink
+```
+
+期待出力の形です。Pod 名の末尾や ClusterIP は環境ごとに変わります。
+
+```txt
+deployment.apps/shortlink          2/2
+pod/shortlink-xxxxxxxxx-aaaaa      1/1   Running
+pod/shortlink-xxxxxxxxx-bbbbb      1/1   Running
+service/shortlink                  ClusterIP   80/TCP
+```
+
+Deployment が `2/2`、Pod が 2 つとも `Running` なら、`replicas: 2` の望ましい状態が満たされています。
+
+ローカルから Service へ接続するため、port-forward を起動します。
+このコマンドは実行中のままにし、別ターミナルで先ほどと同じ `curl` を試してください。
+
+```bash
+kubectl port-forward svc/shortlink 8080:80 -n shortlink
+```
+
 今日は Pod が 2 つあり、Service がどちらかへ転送します。
 ただし `kubectl port-forward svc/shortlink ...` は実際には選ばれた 1 Pod への接続を張るため、ローカルからの `curl` だけでは「POST と GET が別 Pod に行って 404 になる」様子は観察しにくいです。
 port-forward では、同じ接続先 Pod のメモリにあるデータを読めている、と理解してください。
 
 複数 Pod でメモリ保存が問題になる様子を観察したい場合は、クラスタ内に一時 Pod を立て、Service 名へ何度もアクセスします。
 
-```sh
+```bash
 kubectl run curl -n shortlink --rm -it --image=curlimages/curl --command -- sh
 ```
 
 一時 Pod の中で短縮リンクを作り、Service 名へ複数回アクセスします。
 
-```sh
+```bash
 CODE=$(curl -s -X POST http://shortlink/api/links \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com/day09/kubernetes"}' \
@@ -356,7 +426,7 @@ Service がリクエストごとに別 Pod へ振り分けると、短縮リン�
 
 次に、Pod を 1 つ削除して自己修復を観察します。
 
-```sh
+```bash
 kubectl get pod -n shortlink
 POD_NAME=$(kubectl get pod -n shortlink -l app.kubernetes.io/name=shortlink -o jsonpath='{.items[0].metadata.name}')
 echo "$POD_NAME"
@@ -377,7 +447,7 @@ shortlink-xxxxxxxxx-ccccc   1/1   Running             0   5s
 手で `docker run` をやり直したのではなく、宣言した状態に戻すコントローラが働いています。
 watch を止めるには `Ctrl-C` を押し、最後にもう一度全体を確認します。
 
-```sh
+```bash
 kubectl get deploy,rs,pod,svc -n shortlink
 ```
 
@@ -387,10 +457,17 @@ Deployment が `2/2`、Pod が 2 つ `Running` なら、自己修復の観察は
 
 マニフェストだけ消す場合と、kind クラスタごと消す場合のコマンドです。
 
-```sh
-kubectl delete -f k8s/base
+```bash
+kubectl delete -f work/deploy/k8s/base
 kind delete cluster --name shortlink
 ```
+
+## 詰まったら
+
+- `./study hint`：考え方や用語をもう一度確認したいときに使います。
+- `./study todo`：まだ骨組みのまま残っているファイルを一覧したいときに使います。
+- `./study answer`：自分の実装と模範解答の差分をまとめて確認したいときに使います。
+- `./study peek <パス>`：どうしても進めないファイルだけ、模範解答をそのまま確認したいときに使います。たとえば `./study peek deploy/k8s/base/service.yaml` のように指定します。
 
 ## クイズ
 

@@ -8,8 +8,22 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 13 の演習を始めます。
+
+```bash
+./study start 13
+```
+
+`work/` に、実装する関数が `panic("TODO: ...")` になった Go コードと、TODO コメントだけが入った k6 スクリプトが用意されます。まずは何も直さずに次を実行し、テストが落ちることを確認してから始めましょう。
+
+```bash
+./study test
+```
+
 :::note[このページのコードについて]
-このページは Day 13 時点のコードを解説しています。当時のコードは `git checkout day13` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 13 時点のコードを解説しています。`./study start 13` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -23,6 +37,33 @@ import Quiz from '../../components/Quiz.astro';
 - `MaxBytesReader`、`DisallowUnknownFields`、末尾 JSON チェックでリクエストボディを守る理由を理解する。
 - Day 8 の Redis フォールバックを、graceful degradation の例として復習する。
 - k6 で意図的にレートリミットを超え、429 の割合とヘッダを観察できるようになる。
+
+## 今日つくるもの
+
+- `app/internal/middleware/ratelimit.go`
+  - `NewRateLimiter(rps float64, burst int) (*RateLimiter, error)` は、正の `rps` と `burst` だけを受け付け、IP ごとに独立した token bucket を扱えるようにする。
+  - `RateLimitFromEnv() (func(http.Handler) http.Handler, error)` は、`RATE_LIMIT_RPS` と `RATE_LIMIT_BURST` がともに未設定なら何もしない middleware を返し、片方だけの設定、数値でない値、0 以下の値はエラーにする。`TRUST_PROXY=true` のときだけ proxy を信頼する。
+  - `(*RateLimiter).Middleware(next http.Handler) http.Handler` は、通過時に `X-RateLimit-Limit` と `X-RateLimit-Remaining` を付け、上限超過時は下流を呼ばず、`429 Too Many Requests`、`Retry-After`、残数 0 のヘッダを返して `rate_limited_total` を増やす。
+  - `(*RateLimiter).limiterFor(ip string, now time.Time) *rate.Limiter`、`cleanup(now time.Time)`、`evictOldest()` は、IP ごとの状態を並行アクセスから守り、10 分使われていない状態を掃除し、保持数を 1 万件以内に収める。
+  - `(*RateLimiter).clientIP(r *http.Request) string` は、通常は `RemoteAddr` を使い、信頼する proxy が設定されている場合だけ、妥当な `X-Forwarded-For` の先頭 IP を使う。
+  - `retryAfter(limiter *rate.Limiter) string` と `formatRemaining(tokens float64) string` は、再試行までの秒数を 1 秒以上の整数文字列、残数を 0 以上の整数文字列として返す。
+- `app/internal/middleware/timeout.go`
+  - `RequestTimeout(timeout time.Duration) func(http.Handler) http.Handler` は、指定した期限を持つ `context` を下流のリクエストへ渡し、処理後に解放する。
+  - `RequestTimeoutFromEnv() (time.Duration, error)` は、未設定なら 5 秒、正の duration ならその値を返し、不正な値と 0 以下の値はエラーにする。
+- `app/internal/handler/handler.go`
+  - `decodeCreateLinkRequest(w http.ResponseWriter, r *http.Request) (createLinkRequest, error)` は、body を 64 KiB までに制限し、未知フィールドと 1 個目の JSON に続く余計なデータを拒否する。
+  - `POST /api/links` は、過大 body に `413` と `{"error":"request body too large"}`、その他の JSON 契約違反に `400` と `{"error":"invalid json"}`、正常な作成に `201` を返す。
+- `app/internal/middleware/instrumentation.go` と `app/internal/metrics/metrics.go`
+  - `skipRequestInstrumentation(path string) bool` は `/metrics`、`/healthz`、`/readyz` だけを計測対象から外し、それ以外を対象にする。
+  - `RecordRateLimited()` は、拒否したリクエスト専用の `rate_limited_total` counter を 1 増やす。
+- `app/cmd/server/main.go` と storage 実装
+  - request timeout と rate limit middleware を接続し、HTTP server はヘッダ 2 秒、読み書き 10 秒、idle 60 秒の timeout を持たせる。
+  - Redis は各操作を 200ms、最大 2 回の再試行と 50〜200ms の backoff に収め、SQLite と PostgreSQL の各 DB 呼び出しは親 context の内側で 2 秒に収める。
+- `load/day13-ratelimit.js`
+  - `constant-arrival-rate` で `POST /api/links` を送り、`201` と `429` を期待する応答として扱う。429 の割合、必要な 3 ヘッダ、p95 が 250ms 未満であること、予期しない失敗率が 5% 未満であることを観察できるようにする。
+- 合格条件
+  - `./study todo` で未実装が残らず、`./study test` の build、vet、race detector 付きテストがすべて通ること。
+  - `./study run` で API を実際に叩き、最初の burst が通ること、超過時の 429 とヘッダ、入力違反時の 400 / 413、正常時の 201 を確認できること。
 
 ## 解説
 
@@ -68,6 +109,9 @@ token bucket は「平均はこの速度まで。ただし短い burst は許す
 
 実装は `golang.org/x/time/rate` を使います。`RateLimiter` は IP アドレスごとに `rate.Limiter` を持ちます。`RATE_LIMIT_RPS` と `RATE_LIMIT_BURST` が両方設定されたときだけ有効になり、片方だけだと起動時に設定エラーにします。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/middleware/ratelimit.go"
 func RateLimitFromEnv() (func(http.Handler) http.Handler, error) {
 	rpsValue := os.Getenv("RATE_LIMIT_RPS")
@@ -98,6 +142,8 @@ func RateLimitFromEnv() (func(http.Handler) http.Handler, error) {
 ```
 
 環境変数が未設定なら、教材の前半と同じようにレートリミットなしで動きます。本番では「未設定でも安全側に倒す」設計もありますが、今日は学習用として、明示したときだけ有効にします。
+
+</details>
 
 IP ごとの limiter はメモリ上の map に入ります。放置すると、送信元 IP を大量に変える攻撃やスキャンで map が増え続けるため、最後に使った時刻を記録し、古いエントリを定期削除します。さらに上限を 1 万件にして、上限に達したときは最も古いエントリを 1 つ捨てます。教材として読みやすい実装を優先しつつ、無制限にメモリを使わない形にしています。
 
@@ -139,6 +185,9 @@ RateLimitedTotal = promauto.NewCounter(
 
 今日の実装は、クライアント IP ごとに limiter を分けます。ただし、`X-Forwarded-For` は無条件には使いません。`TRUST_PROXY=true` のときだけ、先頭の値が `net/netip` で妥当な IP として parse できた場合に採用します。それ以外は `RemoteAddr` だけを使います。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/middleware/ratelimit.go"
 func (l *RateLimiter) clientIP(r *http.Request) string {
 	if forwardedFor := r.Header.Get("X-Forwarded-For"); l.trustProxy && forwardedFor != "" {
@@ -162,6 +211,8 @@ func (l *RateLimiter) clientIP(r *http.Request) string {
 
 逆の問題もあります。会社、学校、携帯キャリア、家庭用ルータの NAT の背後では、多数の利用者が同じ送信元 IP に見えることがあります。IP 別制限を厳しくしすぎると、1 人の連打で同じ NAT 背後の別ユーザーまで巻き込むかもしれません。
 
+</details>
+
 ### タイムアウトの階層設計
 
 レートリミットは量を絞ります。タイムアウトは時間を絞ります。Day 13 の `app/cmd/server/main.go` は、`http.Server` に複数のタイムアウトを設定しています。
@@ -181,6 +232,9 @@ server := &http.Server{
 
 HTTP サーバの外側だけでは足りません。アプリ内の処理にも、リクエスト単位の `context` timeout を渡します。Day 13 では既定 5 秒で、`REQUEST_TIMEOUT` によって変更できます。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/middleware/timeout.go"
 func RequestTimeout(timeout time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -192,6 +246,8 @@ func RequestTimeout(timeout time.Duration) func(http.Handler) http.Handler {
 	}
 }
 ```
+
+</details>
 
 基本方針は、内側ほど短くです。今回なら、リクエスト context は既定 5 秒、`WriteTimeout` は 10 秒です。内側の context が先に切れれば、storage や Redis 呼び出しはキャンセルを観測できます。外側の WriteTimeout が先に切れると、アプリはまだ処理しているのにクライアントへの書き込みだけが失敗し、原因が追いにくくなります。
 
@@ -237,6 +293,9 @@ result, err := s.db.ExecContext(queryCtx, query, code, url)
 
 入口の守りは、リクエスト数だけではありません。1 件のリクエストが大きすぎたり、想定外の JSON を含んでいたり、正常な JSON の後ろに余計なデータを持っていたりする場合もあります。Day 13 の `POST /api/links` は、ボディを小さく、厳密に読みます。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/handler/handler.go"
 func decodeCreateLinkRequest(w http.ResponseWriter, r *http.Request) (createLinkRequest, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, createLinkMaxBodyBytes)
@@ -260,6 +319,8 @@ func decodeCreateLinkRequest(w http.ResponseWriter, r *http.Request) (createLink
 `DisallowUnknownFields` は、JSON に知らないフィールドがあるとエラーにします。`{"url":"https://example.com","owner":"alice"}` のような入力を黙って受けると、クライアントは `owner` が保存されたと誤解するかもしれません。
 
 最後の `decoder.Decode(&trailing)` は、末尾ゴミを検出します。`{"url":"https://example.com"} trailing` のように、先頭だけ正常な JSON で後ろに余計な文字がある入力を拒否します。実検証では、過大ボディは `413 Request Entity Too Large`、未知フィールドと末尾ゴミは `400 Bad Request`、正常な作成は `201 Created` として観察します。
+
+</details>
 
 ### graceful degradation の復習
 
@@ -293,11 +354,46 @@ Redis が読めなければログを出し、DB へ直行します。キャッ�
 
 ## 手を動かす
 
-まず、レートリミットを有効にしてアプリを起動します。サーバは `app` ディレクトリで起動します。
+### 1. 実装する
+
+まず、リポジトリルートで残っている課題を確認します。
+
+```bash
+./study todo
+```
+
+`work/` にある関数と k6 スクリプトを、「今日つくるもの」の契約を満たすように実装してください。最初からすべてを一度に書かなくてもかまいません。まず token bucket の生成と IP ごとの管理、次に middleware と環境変数、timeout と JSON body の防御、最後にメトリクスと k6、という小さな単位で進めましょう。
+
+### 2. `./study test` で確かめる
+
+ひと区切りごとに、リポジトリルートからテストします。
+
+```bash
+./study test
+```
+
+未実装やコンパイルエラーが出たら、最初のエラーから直してください。すべて実装できると、出力は次の形になります。
+
+```txt title="期待出力例"
+→ 骨組みが埋まっているか
+  ✓ TODOはすべて埋まっている
+
+→ go build ./...
+  ✓ ビルドが通った
+
+→ go vet ./...
+  ✓ vet が黙った
+
+→ go test -race ./...
+  ✓ テストが緑
+```
+
+### 3. `./study run` で実際に叩く
+
+テストが通ったら、レートリミットを有効にして、書いたサーバを起動します。
 
 ```bash title="ターミナル1: アプリを起動"
-cd app
-RATE_LIMIT_RPS=2 RATE_LIMIT_BURST=3 REQUEST_TIMEOUT=5s go run ./cmd/server
+RATE_LIMIT_RPS=2 RATE_LIMIT_BURST=3 REQUEST_TIMEOUT=5s ./study run
 ```
 
 起動ログは JSON で出ます。
@@ -306,7 +402,7 @@ RATE_LIMIT_RPS=2 RATE_LIMIT_BURST=3 REQUEST_TIMEOUT=5s go run ./cmd/server
 {"time":"...","level":"INFO","msg":"shortlink server listening","addr":":8080"}
 ```
 
-別ターミナルから、短時間に 5 回作成リクエストを送ります。
+別ターミナルを開き、リポジトリルートから短時間に 5 回作成リクエストを送ります。
 
 ```bash title="ターミナル2: 連打して 429 を見る"
 for i in 1 2 3 4 5; do
@@ -335,7 +431,13 @@ X-Ratelimit-Remaining: 0
 
 Go の `http.Header` は表示時にヘッダ名を canonicalize するため、curl では `X-Ratelimit-Limit` のように見えることがあります。意味としてはコード内の `X-RateLimit-Limit` と同じです。
 
-次に、不正なリクエストボディを確認します。未知フィールドと末尾ゴミは 400、上限を超えるボディは 413 です。
+次に、サーバ側のターミナルで `Ctrl-C` を押し、レートリミットなしで起動し直します。これで body の検証中に 429 が混ざりません。
+
+```bash title="ターミナル1: body 防御の確認用に起動"
+./study run
+```
+
+別ターミナルから、不正なリクエストボディを確認します。未知フィールドと末尾ゴミは 400、上限を超えるボディは 413 です。
 
 ```bash title="未知フィールドと末尾ゴミを確認"
 curl -s -i \
@@ -346,6 +448,11 @@ curl -s -i \
 curl -s -i \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com"} trailing' \
+  http://localhost:8080/api/links | sed -n '1,8p'
+
+curl -s -i \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/day13/valid"}' \
   http://localhost:8080/api/links | sed -n '1,8p'
 ```
 
@@ -377,20 +484,19 @@ Content-Type: application/json
 {"code":"...","short_url":"http://localhost:8080/..."}
 ```
 
-最後に k6 で、意図的に制限を超える負荷を流します。サーバは `RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20` くらいで起動し直します。
+最後に k6 で、意図的に制限を超える負荷を流します。もう一度 `Ctrl-C` で止め、`RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20` で起動し直します。
 
 ```bash title="ターミナル1: k6 用に起動し直す"
-cd app
-RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20 go run ./cmd/server
+RATE_LIMIT_RPS=10 RATE_LIMIT_BURST=20 ./study run
 ```
 
 リポジトリルートから k6 を実行します。
 
 ```bash title="ターミナル2: k6 で 429 割合を見る"
-BASE_URL=http://localhost:8080 RATE=80 k6 run load/day13-ratelimit.js
+BASE_URL=http://localhost:8080 RATE=80 k6 run work/load/day13-ratelimit.js
 ```
 
-`load/day13-ratelimit.js` は `constant-arrival-rate` で `POST /api/links` を送り続けます。429 は期待される防御動作なので、`http.setResponseCallback` で失敗扱いから外しています。
+`work/load/day13-ratelimit.js` は `constant-arrival-rate` で `POST /api/links` を送り続けます。429 は期待される防御動作なので、`http.setResponseCallback` で失敗扱いから外しています。
 
 ```js title="load/day13-ratelimit.js"
 http.setResponseCallback(http.expectedStatuses({ min: 200, max: 399 }, 429));
@@ -415,6 +521,13 @@ sum(rate(http_requests_total[1m])) by (route, status)
 ```promql title="429 を専用カウンタで確認"
 rate(rate_limited_total[1m])
 ```
+
+## 詰まったら
+
+- `./study hint`：token bucket や timeout の考え方をもう一度確認したいときに、この日の解説を開きます。
+- `./study todo`：`work/` に残っている未実装の関数や TODO ファイルを一覧します。
+- `./study answer`：自分の実装と Day 13 の模範解答を差分で比べます。まず自分で書いてから使いましょう。
+- `./study peek <パス>`：どうしても進めない 1 ファイルだけ、模範解答をそのまま確認します。たとえば `./study peek app/internal/middleware/ratelimit.go` です。
 
 ## クイズ
 

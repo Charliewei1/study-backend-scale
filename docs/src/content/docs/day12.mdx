@@ -8,8 +8,22 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 12 の演習を始めます。
+
+```bash
+./study start 12
+```
+
+`work/` に、実装する関数が `panic("TODO: ...")` になった Go コードと、TODO コメントだけが入った監視設定ファイルが用意されます。まずは何も直さずに次を実行し、テストが落ちることを確認してから始めましょう。
+
+```bash
+./study test
+```
+
 :::note[このページのコードについて]
-このページは Day 12 時点のコードを解説しています。当時のコードは `git checkout day12` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 12 時点のコードを解説しています。`./study start 12` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -21,6 +35,34 @@ import Quiz from '../../components/Quiz.astro';
 - ルートラベルのカーディナリティと、`/{code}` を `redirect` に正規化する理由を説明できるようになる。
 - JSON 構造化ログが、grep だけの運用より強い理由を理解する。
 - Prometheus UI と Grafana で、リクエスト数、p95、キャッシュヒット率を確認できるようになる。
+
+## 今日つくるもの
+
+- `app/internal/metrics/metrics.go`
+  - `RecordHTTPRequest(method, route string, status int, duration time.Duration)` で、method・route・status ごとのリクエスト数と、route ごとの処理時間を記録する。
+  - `RecordCacheHit()` と `RecordCacheMiss()` で、キャッシュの hit と miss を別々の counter に記録する。
+- `app/internal/middleware/status.go`
+  - `newStatusResponseWriter(w http.ResponseWriter) *statusResponseWriter`、`WriteHeader(status int)`、`Write([]byte) (int, error)`、`Unwrap() http.ResponseWriter` を実装する。
+  - status を明示しないレスポンスは 200 として扱い、最初に書かれた status を保持し、元の `http.ResponseWriter` へ処理を委譲できるようにする。
+- `app/internal/middleware/metrics.go`
+  - `Metrics(next http.Handler) http.Handler` で、下流の処理後に HTTP method・正規化した route・status・処理時間を記録する。
+  - `routeLabel(r *http.Request) string` で、空の route は `unknown`、`/{code}` は `redirect` とし、method 付きの pattern から path 部分を取り出す。短縮コードそのものをラベルにしない。
+- `app/internal/middleware/requestlog.go`
+  - `RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler` で、各 HTTP リクエストの `method`、`path`、`status`、`duration_ms`、`remote` を構造化ログに出す。
+  - `remoteAddr(r *http.Request) string` で、`X-Forwarded-For` があれば先頭の値を優先し、なければ接続元アドレスから host を取り出す。
+- `app/cmd/server/main.go`
+  - `newLogger() *slog.Logger` で JSON logger を作り、`LOG_LEVEL` の `debug`、`warn` / `warning`、`error` と、既定の `info` を反映する。
+  - `fatal(msg string, args ...any)` で致命的なエラーを構造化ログへ記録して終了する。
+  - `GET /metrics` を公開し、アプリへ metrics middleware と request logger を接続する。
+- `app/internal/cache/redis.go`
+  - Redis の hit と miss を既存の統計に加えて Prometheus counter にも記録する。Redis の失敗は構造化ログへ残し、これまでどおり storage へフォールバックする。
+- `deploy/compose.monitoring.yaml`、`deploy/prometheus/prometheus.yml`
+  - Compose に Prometheus と Grafana を追加し、Prometheus が 15 秒間隔で `app:8080/metrics` を scrape できるようにする。
+- `deploy/grafana/provisioning/datasources/prometheus.yaml`、`deploy/grafana/provisioning/dashboards/shortlink.yaml`、`deploy/grafana/dashboards/shortlink-red-cache.json`
+  - Prometheus datasource と `Shortlink RED and Cache` dashboard を自動登録し、Request Rate、Error Rate、Latency p95、Cache Hit Ratio を表示する。
+- 合格条件
+  - `./study todo` で未実装が残らず、`./study test` の build、vet、race detector 付きテストがすべて通ること。
+  - `./study run` と監視スタックで API を実際に叩き、JSON ログ、`/metrics`、Prometheus target、Grafana dashboard を確認できること。
 
 ## 解説
 
@@ -50,6 +92,9 @@ gauge は増えたり減ったりする現在値です。現在の goroutine 数
 
 histogram は、観測値をバケットに分けて数えます。今日の `http_request_duration_seconds` は、リクエスト時間を histogram として記録します。`0.005 秒以下が何件、0.01 秒以下が何件...` のように累積バケットを持ちます。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/metrics/metrics.go"
 HTTPRequestsTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{Name: "http_requests_total"},
@@ -64,6 +109,8 @@ CacheMissesTotal = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_misse
 ```
 
 `http_requests_total` は `method`、`route`、`status` の組み合わせごとに系列が分かれます。たとえば `GET` の `redirect` で `302`、`POST` の `/api/links` で `201` です。
+
+</details>
 
 ### なぜ平均ではなく p95 を見るのか
 
@@ -100,6 +147,9 @@ Day 13 のレートリミットで返る 429 は、ルーティング前に拒�
 
 メトリクスは HTTP middleware で記録します。開始時刻を取り、下流のハンドラを呼び、ステータスと経過時間を記録します。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/middleware/metrics.go"
 start := time.Now()
 rec := newStatusResponseWriter(w)
@@ -109,9 +159,14 @@ metrics.RecordHTTPRequest(r.Method, routeLabel(r), rec.status, time.Since(start)
 
 標準の `http.ResponseWriter` は、あとからステータスコードを読めません。そのため `statusResponseWriter` で `WriteHeader` を包み、実際に返したステータスを覚えます。この部品があるので、`http_requests_total{method="GET",route="redirect",status="302"}` のような実カウントが取れます。
 
+</details>
+
 ### `/metrics` を公開する
 
 Prometheus は、アプリから push してもらうのではなく、自分から scrape しに行きます。アプリ側は `/metrics` を公開します。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```go title="app/cmd/server/main.go"
 mux.Handle("GET /metrics", promhttp.Handler())
@@ -123,9 +178,14 @@ h := middleware.RequestLogger(logger)(middleware.Metrics(mux))
 
 `/metrics`、`/healthz`、`/readyz` は監視や probe のためのインフラ由来のリクエストなので、RED のリクエストメトリクスとリクエストログからは除外します。
 
+</details>
+
 ### キャッシュヒット率を見る
 
 Day 8 の Redis cache-aside は、Day 12 で Prometheus から見えるようになりました。hit と miss は counter として増やします。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```go title="app/internal/cache/redis.go"
 if url, err := s.client.Get(ctx, key); err == nil {
@@ -141,6 +201,8 @@ if url, err := s.client.Get(ctx, key); err == nil {
 }
 ```
 
+</details>
+
 キャッシュヒット率は、hit の rate を hit と miss の rate の合計で割ります。
 
 ```promql title="キャッシュヒット率"
@@ -155,6 +217,9 @@ clamp_min((sum(rate(cache_hits_total[1m])) or vector(0)) + (sum(rate(cache_misse
 
 Day 12 の `cmd/server/main.go` は、標準ライブラリの `log/slog` を JSON handler で使います。ログレベルは `LOG_LEVEL` で `debug`、`warn`、`error`、既定の `info` を選べます。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/middleware/requestlog.go"
 logger.Info("http request",
 	"method", r.Method,
@@ -164,6 +229,8 @@ logger.Info("http request",
 	"remote", remoteAddr(r),
 )
 ```
+
+</details>
 
 実際のログは 1 行 JSON です。
 
@@ -177,6 +244,9 @@ logger.Info("http request",
 
 監視スタックは、通常の Compose に `compose.monitoring.yaml` を重ねて起動します。Prometheus は `9090`、Grafana は `${GRAFANA_PORT:-3000}:3000` で公開されます。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```yaml title="deploy/compose.monitoring.yaml"
 prometheus:
   image: prom/prometheus:v2.55.1
@@ -188,6 +258,11 @@ grafana:
 
 Grafana のホスト側ポートは `GRAFANA_PORT` で変更できます。既定は `3000` です。Prometheus は Compose ネットワーク上の `app:8080` を scrape します。
 
+</details>
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```yaml title="deploy/prometheus/prometheus.yml"
 scrape_configs:
   - job_name: shortlink
@@ -197,6 +272,8 @@ scrape_configs:
 ```
 
 Grafana は provisioning で datasource と dashboard を自動登録します。datasource は `http://prometheus:9090`、ダッシュボード名は `Shortlink RED and Cache` です。
+
+</details>
 
 ```promql title="Grafana ダッシュボードの主なクエリ"
 sum(rate(http_requests_total[5m])) by (route)
@@ -231,16 +308,67 @@ p95 レイテンシとキャッシュヒット率は、先ほどの `histogram_q
 
 ## 手を動かす
 
-リポジトリルートから、アプリと監視スタックをまとめて起動します。
+### 1. 実装する
 
-```sh
-cd deploy
-docker compose -f compose.yaml -f compose.monitoring.yaml up -d --build
+まず、リポジトリルートで残っている課題を確認します。
+
+```bash
+./study todo
 ```
 
-起動状態を確認します。
+`work/` にある Go 関数と監視設定を、「今日つくるもの」の契約を満たすように実装してください。最初からすべてを一度に書かなくてもかまいません。status を取得する wrapper、metrics middleware、request logger、監視設定、既存コードへの接続、という小さな単位で進めましょう。
 
-```sh
+### 2. `./study test` で確かめる
+
+ひと区切りごとに、リポジトリルートからテストします。
+
+```bash
+./study test
+```
+
+未実装やコンパイルエラーが出たら、最初のエラーから直してください。すべて実装できると、出力は次の形になります。
+
+```txt
+→ 骨組みが埋まっているか
+  ✓ TODOはすべて埋まっている
+
+→ go build ./...
+  ✓ ビルドが通った
+
+→ go vet ./...
+  ✓ vet が黙った
+
+→ go test -race ./...
+  ✓ テストが緑
+```
+
+### 3. `./study run` で実際に叩く
+
+テストが通ったら、まず書いたサーバをそのまま起動します。
+
+```bash
+./study run
+```
+
+別のターミナルからヘルスチェックと metrics endpoint を確認してください。
+
+```bash
+curl http://localhost:8080/healthz
+curl -s http://localhost:8080/metrics | grep '^# TYPE http_requests_total'
+```
+
+期待出力です。
+
+```txt
+ok
+# TYPE http_requests_total counter
+```
+
+確認できたら、サーバを起動したターミナルで `Ctrl-C` を押します。次は Redis を含むアプリと監視スタックを、`work/deploy/` からまとめて起動します。
+
+```bash
+cd work/deploy
+docker compose -f compose.yaml -f compose.monitoring.yaml up -d --build
 docker compose -f compose.yaml -f compose.monitoring.yaml ps
 ```
 
@@ -255,19 +383,9 @@ prometheus   Up
 grafana      Up
 ```
 
-アプリのヘルスチェックを確認します。
-
-```sh
-curl http://localhost:8080/healthz
-```
-
-```txt
-ok
-```
-
 Prometheus target が up か確認します。実検証では、`compose.yaml` と `compose.monitoring.yaml` を重ねた構成で target が up になっています。
 
-```sh
+```bash
 curl -s 'http://localhost:9090/api/v1/query?query=up{job="shortlink"}'
 ```
 
@@ -279,7 +397,7 @@ curl -s 'http://localhost:9090/api/v1/query?query=up{job="shortlink"}'
 
 Grafana の health API も確認します。`GRAFANA_PORT` を変えた場合は、そのポートを使ってください。実検証では `/api/health` が HTTP 200 を返しています。
 
-```sh
+```bash
 curl -i http://localhost:${GRAFANA_PORT:-3000}/api/health
 ```
 
@@ -291,7 +409,7 @@ HTTP/1.1 200 OK
 
 短縮リンクを 1 つ作ります。
 
-```sh
+```bash
 CODE=$(curl -s -X POST http://localhost:8080/api/links \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com/day12/observability"}' \
@@ -307,7 +425,7 @@ aB3xY9Q
 
 curl で少し負荷をかけます。
 
-```sh
+```bash
 for i in $(seq 1 10); do
   curl -s -o /dev/null -w '%{http_code}\n' "http://localhost:8080/$CODE"
 done
@@ -323,7 +441,7 @@ done
 
 アプリの JSON ログを確認します。実検証では、ログに `method`、`path`、`status`、`duration_ms` が出ています。
 
-```sh
+```bash
 docker compose -f compose.yaml -f compose.monitoring.yaml logs app --tail=5
 ```
 
@@ -333,7 +451,7 @@ docker compose -f compose.yaml -f compose.monitoring.yaml logs app --tail=5
 
 次に `/metrics` を直接見ます。
 
-```sh
+```bash
 curl -s http://localhost:8080/metrics | grep -E 'http_requests_total|cache_(hits|misses)_total' | head -20
 ```
 
@@ -348,7 +466,7 @@ cache_misses_total 1
 
 histogram のバケットも見ます。
 
-```sh
+```bash
 curl -s http://localhost:8080/metrics | grep 'http_request_duration_seconds_bucket{route="redirect"' | head
 ```
 
@@ -375,9 +493,16 @@ Grafana は `http://localhost:${GRAFANA_PORT:-3000}` で開きます。`GRAFANA_
 
 確認が終わったら片付けます。
 
-```sh
+```bash
 docker compose -f compose.yaml -f compose.monitoring.yaml down -v
 ```
+
+## 詰まったら
+
+- `./study hint`：考え方や用語をもう一度確認したいときに、この日の解説を開きます。
+- `./study todo`：未実装の関数や、まだ TODO のままの設定ファイルを一覧します。
+- `./study answer`：自分の実装と Day 12 の模範解答を差分で比べます。
+- `./study peek <パス>`：どうしても進めないファイルだけ、模範解答をそのまま確認します。たとえば `./study peek app/internal/middleware/metrics.go` です。
 
 ## クイズ
 

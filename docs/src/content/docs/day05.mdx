@@ -8,8 +8,19 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 5 の演習を始めましょう。
+
+```bash
+./study start 5
+```
+
+`work/` に、今日実装するファイルが用意されます。Dockerfile や `.dockerignore`、README は、何を書くかを示す TODO コメントだけの状態です。
+まず `./study test` を実行して、まだ合格条件を満たしていないことを確認してから、TODO を埋めていきましょう。
+
 :::note[このページのコードについて]
-このページは Day 5 時点のコードを解説しています。当時のコードは `git checkout day05` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 5 時点のコードを解説しています。`./study start 5` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -22,6 +33,26 @@ import Quiz from '../../components/Quiz.astro';
 - distroless と非 root 実行が、攻撃面の縮小につながることを理解する。
 - `CGO_ENABLED=0` と静的リンクの意味を、コンテナ実行と結びつけて説明できるようになる。
 - Docker で `shortlink` を build / run し、`curl` と `docker images` で確認する。
+
+## 今日つくるもの
+
+今日は Go の関数を追加するのではなく、次の 4 ファイルを作ります。ここでは実装方法ではなく、満たすべき契約だけを確認しておきましょう。
+
+- `work/deploy/Dockerfile`
+  - Go アプリをビルドする stage と、完成したバイナリを実行する stage を分けた multi-stage build にする。
+  - Linux 向けに `CGO_ENABLED=0` で `./cmd/server` をビルドする。
+  - 実行用には小さいベースイメージを使い、非 root ユーザーで起動する。
+  - コンテナの 8080 番ポートで HTTP サーバを起動し、`GET /healthz` が成功して本文 `ok` を返すようにする。
+  - ビルドや起動に失敗する、`/healthz` に接続できない、最終イメージが 50MB 以上になる、のいずれかなら完全テストは不合格になる。
+- `work/deploy/Dockerfile.single`
+  - 比較用として、ビルドと実行を同じ Go イメージで行う single-stage 版を作る。
+  - multi-stage 版と同じサーバを 8080 番ポートで起動できるようにする。
+- `work/app/.dockerignore`
+  - Git やエディタの設定、ビルド・テストの出力、ローカルの DB や一時ファイルを build context から除外する。
+- `work/deploy/README.md`
+  - リポジトリルートからの build、run、`/healthz` の確認方法と、single-stage 版との比較方法を説明する。
+
+通常の `./study test` で Dockerfile の構造を確認でき、`./study test --full` で実際のビルド、イメージサイズ、コンテナ起動、`/healthz` の応答まで通れば合格です。
 
 ## 解説
 
@@ -76,6 +107,9 @@ Docker は、同じ入力で同じ命令を実行するなら、過去の結果�
 レイヤキャッシュが効くと、毎回すべてを最初からビルドしなくてよくなります。
 Go の依存モジュールのダウンロードには時間がかかるため、今回の Dockerfile は `go.mod` と `go.sum` を先にコピーしています。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```dockerfile title="deploy/Dockerfile"
 FROM golang:1.24 AS builder
 
@@ -100,6 +134,8 @@ Docker は `COPY . .` 以降だけをやり直せばよくなります。
 最初から `COPY . .` していたら、Go ファイルを 1 行変えただけでも、その後ろにある `go mod download` のキャッシュが無効になります。
 変わりにくいものを先に置き、変わりやすいものを後ろに置くのが基本です。
 
+</details>
+
 ### .dockerignore で build context を小さくする
 
 Docker build では、最後の引数に指定したディレクトリが build context として Docker に送られます。
@@ -113,6 +149,9 @@ docker build -f deploy/Dockerfile -t shortlink:dev app
 つまり、Dockerfile は `deploy/Dockerfile` にありますが、`COPY . .` の `.` はリポジトリルートではなく `app/` を指します。
 
 `app/.dockerignore` は、build context に含めないものを指定します。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```dockerignore title="app/.dockerignore"
 .git
@@ -140,11 +179,17 @@ tmp/
 不要なファイルを build context に入れないことで、転送量を減らし、キャッシュの無駄な無効化も避けられます。
 `*.db` や `tmp/` を除外している点は、Day 3 の SQLite 確認と関係します。
 ローカルで作ったデータベースファイルを、うっかりイメージへ焼き込まないためです。
+
+</details>
+
 ### multi-stage build
 
 今回の本命は `deploy/Dockerfile` です。
 この Dockerfile は multi-stage build になっています。
 ビルド用の stage と、実行用の stage を分けています。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```dockerfile title="deploy/Dockerfile"
 FROM golang:1.24 AS builder
@@ -184,10 +229,15 @@ Go コンパイラやビルドに必要なツールが入っており、`go mod 
 Go ツールチェーンを含む single-stage 版と比べると、かなり小さくなります。
 サイズが小さいと、push / pull が速くなり、デプロイやスケールアウトの待ち時間も減ります。
 
+</details>
+
 ### single-stage 版と何が違うのか
 
 比較用に `deploy/Dockerfile.single` も用意されています。
 これは、ビルドと実行を同じ `golang:1.24` イメージの中で行います。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```dockerfile title="deploy/Dockerfile.single"
 FROM golang:1.24
@@ -216,6 +266,8 @@ CMD ["/usr/local/bin/shortlink"]
 
 multi-stage 版は `golang:1.24` でコンパイルし、distroless に完成バイナリだけを置きます。
 single-stage 版は `golang:1.24` の中でコンパイルし、そのまま実行するため、Go ツールチェーンや shell も最終イメージに含みます。
+
+</details>
 
 ### distroless と非 root 実行
 
@@ -279,14 +331,70 @@ Day 3 で SQLite ドライバに `modernc.org/sqlite` を使った理由も、�
 
 ## 手を動かす
 
-ここでは、リポジトリルートから Docker イメージをビルドして実行します。
-ターミナルを 2 つ使います。
-1 つ目で `docker run` し、2 つ目で `curl` と `docker images` を実行します。
+ここからは、`work/` の TODO を自分で実装し、テストし、実際にサーバへリクエストを送ります。コマンドはすべてリポジトリルートで実行します。
 
-まず、multi-stage 版をビルドします。
+### 1. TODO を実装する
+
+`work/deploy/Dockerfile`、`work/deploy/Dockerfile.single`、`work/app/.dockerignore`、`work/deploy/README.md` を実装してください。
+まずは上の「今日つくるもの」にある契約を満たすことに集中しましょう。
+
+残っている TODO は、いつでも次のコマンドで確認できます。
+
+```bash
+./study todo
+```
+
+### 2. テストで確かめる
+
+書けたら、最初に軽いテストを実行します。
+
+```bash
+./study test
+```
+
+multi-stage build、`CGO_ENABLED=0`、非 root 実行、小さい実行用ベースイメージという条件がすべて通るまで修正しましょう。
+続いて Docker を使う完全テストで、ビルドと起動まで確かめます。
+
+```bash
+./study test --full
+```
+
+完全テストでは、イメージが 50MB 未満であることと、起動したコンテナの `GET /healthz` が成功することも確認されます。
+
+### 3. `./study run` で API を実際に叩く
+
+ターミナルを 2 つ使います。1 つ目でサーバを起動してください。
+
+```bash
+./study run
+```
+
+期待するログは次の形です。
+
+```txt
+shortlink server listening on :8080
+```
+
+2 つ目のターミナルからヘルスチェックします。
+
+```bash
+curl http://localhost:8080/healthz
+```
+
+期待出力は次の通りです。
+
+```txt
+ok
+```
+
+確認できたら、1 つ目のターミナルで `Ctrl+C` を押してサーバを止めます。
+
+### 4. 作った Dockerfile を自分でも動かす
+
+テストに任せるだけでなく、コンテナとして動く様子も確認しましょう。まず、multi-stage 版をビルドします。
 
 ```sh
-docker build -f deploy/Dockerfile -t shortlink:dev app
+docker build -f work/deploy/Dockerfile -t shortlink:dev work/app
 ```
 
 期待出力は、最後に `shortlink:dev` へタグ付けされる形です。
@@ -301,7 +409,7 @@ BuildKit を使っている場合、表示は環境によって少し変わり�
 
 次に、コンテナを起動します。
 
-```sh
+```bash
 docker run --rm -p 8080:8080 shortlink:dev
 ```
 
@@ -311,9 +419,9 @@ docker run --rm -p 8080:8080 shortlink:dev
 shortlink server listening on :8080
 ```
 
-別のターミナルでヘルスチェックします。
+別のターミナルで、もう一度ヘルスチェックします。
 
-```sh
+```bash
 curl http://localhost:8080/healthz
 ```
 
@@ -326,13 +434,13 @@ ok
 次に、比較用の single-stage 版もビルドします。
 1 つ目のターミナルで動いているコンテナは `Ctrl+C` で止めて構いません。
 
-```sh
-docker build -f deploy/Dockerfile.single -t shortlink:single app
+```bash
+docker build -f work/deploy/Dockerfile.single -t shortlink:single work/app
 ```
 
 サイズを比較します。
 
-```sh
+```bash
 docker images shortlink
 ```
 
@@ -344,6 +452,13 @@ REPOSITORY   TAG      IMAGE ID       CREATED          SIZE
 shortlink    dev      ...            ...              19.5MB
 shortlink    single   ...            ...              1GB前後
 ```
+
+## 詰まったら
+
+- `./study hint`：考え方や今日の解説を読みたいときに使います。
+- `./study todo`：まだ埋めていない TODO と対象ファイルを確認したいときに使います。
+- `./study answer`：自分の実装と模範解答の差分をまとめて確認したいときに使います。
+- `./study peek <パス>`：指定した 1 ファイルの模範解答をそのまま読みたいときに使います。たとえば `./study peek deploy/Dockerfile` です。
 
 ## クイズ
 

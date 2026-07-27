@@ -8,8 +8,23 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+まず、リポジトリのルートで Day 2 の演習を用意します。
+
+```bash
+./study start 2
+```
+
+`work/` に、実装する関数が `panic("TODO: ...")` になったコードや、TODO コメントだけのファイルが置かれます。
+まずは次のコマンドを実行し、未実装の状態ではテストが落ちることを確認してから始めましょう。
+
+```bash
+./study test
+```
+
 :::note[このページのコードについて]
-このページは Day 2 時点のコードを解説しています。当時のコードは `git checkout day02` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 2 時点のコードを解説しています。`./study start 2` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -21,6 +36,30 @@ import Quiz from '../../components/Quiz.astro';
 - Go の table-driven テストと `t.Run` の書き方に慣れる。
 - `httptest.NewRequest` と `httptest.NewRecorder` でハンドラをテストする流れを理解する。
 - `go test -cover` の出力を見て、カバレッジの意味を説明できるようになる。
+
+## 今日つくるもの
+
+今日は `work/app/` に、API の契約が明確で、テストで振る舞いを確かめられる URL 短縮サーバを完成させます。
+実装の中身を先に探すのではなく、次の条件を満たすことを目標にしてください。
+
+- `app/internal/handler/handler.go`
+  - `func New(shortener *shortener.Shortener, store *storage.MemoryStore, baseURL string) http.Handler`
+  - `func (h *Handler) createLink(w http.ResponseWriter, r *http.Request)`
+  - `func (h *Handler) getLink(w http.ResponseWriter, r *http.Request)`
+  - `func (h *Handler) redirect(w http.ResponseWriter, r *http.Request)`
+  - `func (h *Handler) shortURL(code string) string`
+  - `func validateURL(raw string) error`
+  - `func writeJSONError(w http.ResponseWriter, status int, message string)`
+  - `func writeJSON(w http.ResponseWriter, status int, v any)`
+  - `POST /api/links` は `http` または `https` の URL を受け付け、`201 Created`、作成した短縮 URL の `Location` ヘッダ、`code` と `short_url` を含む JSON を返す。
+  - 不正な JSON、空または空白だけの URL、解析できない URL、`http` / `https` 以外のスキーム、ホストのない URL は保存せず、`400 Bad Request` と `{"error":"..."}` 形式の JSON を返す。
+  - `GET /api/links/{code}` は、登録済みなら `200 OK` と `code`、元の `url`、`short_url` を含む JSON を返し、未登録なら `404 Not Found` と `{"error":"link not found"}` を返す。
+  - `GET /{code}` は、登録済みなら元の URL へ `302 Found` でリダイレクトし、未登録なら `404 Not Found` と `{"error":"link not found"}` を返す。
+  - JSON レスポンスの `Content-Type` は `application/json` に統一する。
+- `app/Makefile`
+  - `make run`、`make test`、`make vet`、`make fmt` で、それぞれサーバ起動、全パッケージのテスト、静的検査、フォーマットを実行できるようにする。
+- 合格条件
+  - `./study test` を実行し、TODO が残っていないこと、`go build ./...`、`go vet ./...`、`go test ./...` がすべて成功すること。
 
 ## 解説
 
@@ -90,6 +129,9 @@ HTTP メソッドの意味に合わせると、クライアント、プロキシ
 Day 2 の `createLink` は、成功時に `Location` ヘッダを設定します。
 ここには、作成された短縮 URL が入ります。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/handler/handler.go"
 if err := validateURL(req.URL); err != nil {
 	writeJSONError(w, http.StatusBadRequest, err.Error())
@@ -104,6 +146,8 @@ w.WriteHeader(http.StatusCreated)
 
 レスポンスボディにも `short_url` は入っています。
 それでも `Location` ヘッダを付けるのは、HTTP の慣習として「作成されたリソースの場所」を示せるからです。
+
+</details>
 
 ```http
 HTTP/1.1 201 Created
@@ -121,6 +165,9 @@ Day 1 では、エラーに `http.Error` を使っていました。
 これは簡単ですが、レスポンスはテキストになり、エラーごとに形が揺れやすくなります。
 Day 2 では、エラーをすべて JSON に統一しました。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/handler/handler.go"
 type errorResponse struct {
 	Error string `json:"error"`
@@ -137,11 +184,22 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 呼び出し側は、失敗したら常に `error` フィールドを読めばよくなります。
 API は成功時だけでなく、失敗時も契約です。
 
+</details>
+
 ### URL バリデーション
 
 URL 短縮サービスは、ユーザーから URL を受け取ります。
 壊れた値を保存してしまうと、あとでリダイレクトするときに壊れた値を返すことになります。
 Day 2 では、保存する前に `validateURL` で検査します。
+
+関数のシグネチャは次のとおりです。
+
+```go title="app/internal/handler/handler.go"
+func validateURL(raw string) error
+```
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```go title="app/internal/handler/handler.go"
 func validateURL(raw string) error {
@@ -170,6 +228,8 @@ func validateURL(raw string) error {
 ここでのポイントは、正規表現で全部を頑張って判定していないことです。
 URL の解析は標準ライブラリの `net/url` に任せ、サービスとして許可する条件だけを明示します。
 バリデーションは保存前の入口で行うのが基本です。
+
+</details>
 
 ### メタ情報取得 API
 
@@ -272,28 +332,43 @@ API では、正常系だけでなく、壊れた入力や見つからないコ�
 
 ## 手を動かす
 
-まず、アプリ側のテストを実行します。
+### 1. TODO を実装する
 
-```sh
-cd app
-make test
+`work/app/internal/handler/handler.go` と `work/app/Makefile` を開き、「今日つくるもの」の契約を満たすように実装します。
+残っている TODO は、次のコマンドで確認できます。
+
+```bash
+./study todo
 ```
 
-期待出力は、`cmd/server` は `[no test files]`、`internal/handler`、`internal/shortener`、`internal/storage` は `ok` になる形です。
+まずは畳まれた実装を開かずに、テストが要求している入力と出力から考えてみましょう。
 
-続いてカバレッジを見ます。
+### 2. `./study test` で確かめる
 
-```sh
-go test -cover ./...
+実装できたら、リポジトリのルートで合格条件を確認します。
+
+```bash
+./study test
+```
+
+失敗したときは、表示されたビルドエラーやテスト名を手がかりに修正し、すべて成功するまで繰り返してください。
+内部で実行されるテストでは、`cmd/server` は `[no test files]`、`internal/handler`、`internal/shortener`、`internal/storage` は `ok` になる形です。
+
+合格したら、カバレッジも確認してみましょう。
+
+```bash
+(cd work/app && go test -cover ./...)
 ```
 
 期待出力では、各パッケージの末尾に `coverage: ...% of statements` が表示されます。
 
-次に、ターミナルを 2 つ使ってエラー系を確認します。
+### 3. `./study run` で実際に叩く
+
+自動テストが通ったら、ターミナルを 2 つ使ってエラー系を確認します。
 1 つ目でサーバを起動します。
 
-```sh
-make run
+```bash
+./study run
 ```
 
 別のターミナルで、不正な JSON、空の URL、許可していないスキームを順に送ります。
@@ -354,6 +429,13 @@ curl -i http://localhost:8080/missing
 
 Day 1 では未知コードが標準の `404 page not found` でした。
 Day 2 では API として扱いやすいように、ここも JSON エラーへ揃っています。
+
+## 詰まったら
+
+- `./study hint`: 今日の考え方を確認したいときに使います。
+- `./study todo`: まだ残っている TODO を一覧したいときに使います。
+- `./study answer`: 自分の実装と模範解答の差分を見比べたいときに使います。
+- `./study peek <パス>`: 指定したファイルの模範解答をそのまま確認したいときに使います。
 
 ## クイズ
 

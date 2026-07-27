@@ -8,8 +8,19 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+リポジトリのルートで、Day 7 の演習を用意します。
+
+```bash
+./study start 7
+```
+
+`work/` に、実装する関数が `panic("TODO: ...")` になった Go コードと、TODO コメントだけが入った k6 スクリプトや計測メモが用意されます。
+まず `./study test` を実行し、未実装のためテストが落ちることを確認してから、TODO を一つずつ埋めていきましょう。
+
 :::note[このページのコードについて]
-このページは Day 7 時点のコードを解説しています。当時のコードは `git checkout day07` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 7 時点のコードを解説しています。`./study start 7` で当時の状態から演習を始められます。模範解答は `./study peek <パス>` で読めます。
 :::
 
 ## 今日のゴール
@@ -22,6 +33,22 @@ import Quiz from '../../components/Quiz.astro';
 - `load/day07-baseline.js` の `setup` から 90/10 混合シナリオまでを読めるようになる。
 - `DEBUG_ADDR` で pprof を別ポートに出す理由を説明できるようになる。
 - 今日の実測値を、15 日間の比較に使うベースラインとして記録できるようになる。
+
+## 今日つくるもの
+
+- `work/app/cmd/server/main.go` に `func newDebugServer() *http.Server` を実装し、`main()` から起動と終了を管理します。
+  - `DEBUG_ADDR` が空ならデバッグサーバを起動せず、設定されていればそのアドレスで通常 API とは別の HTTP サーバを使います。
+  - 専用の `ServeMux` で `/debug/pprof/`、`/debug/pprof/cmdline`、`/debug/pprof/profile`、`/debug/pprof/symbol`、`/debug/pprof/trace` を公開します。
+  - デバッグサーバの起動エラーも通常サーバと同じ経路で受け取り、終了シグナルを受けたら両方を graceful shutdown します。
+- `work/load/day07-baseline.js` を作ります。
+  - 接続先は `__ENV.BASE_URL` で切り替えられ、未指定なら `http://localhost:8080` を使います。
+  - `ramping-vus` で 30 秒かけて 20 VU、次の 1 分で 50 VU、最後の 30 秒で 0 VU に戻します。
+  - p95 レイテンシ 100ms 未満、HTTP 失敗率 1% 未満を `thresholds` に定義します。
+  - `setup()` で短縮 URL を 100 件作ります。作成 API が `201` を返さない、またはレスポンスに `code` がない場合は、準備を失敗として負荷試験を中止します。
+  - `export default function (data)` では、90% を既存コードへの GET、10% を新規 URL の POST にします。GET は外部サイトまで追跡せず、`302` と `Location` を確認します。POST は `201` と `code` を確認し、各 iteration の最後に 1 秒待ちます。
+- `work/load/README.md` を作り、k6 の実行方法、p95・`iterations`・`http_reqs` の読み方、Day 7 以降の計測結果を残す表を用意します。
+- HTTP API の契約は変えません。`GET /healthz` は `ok`、`POST /api/links` は短縮コードと URL、`GET /{code}` は保存先への `302 Found` を返せる状態を保ちます。
+- 合格条件は、TODO が残っておらず、k6 スクリプトに `thresholds`、`__ENV.BASE_URL`、VU を段階的に変える設定があり、Go アプリに `net/http/pprof` が組み込まれていることです。`./study test --full` では、実際にサーバを起動して k6 が thresholds を満たして完走するところまで確認します。
 
 ## 解説
 
@@ -88,6 +115,9 @@ k6 では、スクリプトの `default` 関数を繰り返し実行する仮想
 
 `load/day07-baseline.js` では、`ramping-vus` を使っています。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```js title="load/day07-baseline.js"
 export const options = {
   scenarios: {
@@ -100,11 +130,17 @@ export const options = {
       ],
     },
   },
+  thresholds: {
+    http_req_duration: ['p(95)<100'],
+    http_req_failed: ['rate<0.01'],
+  },
 };
 ```
 
 これは、最初の 30 秒で 0 VU から 20 VU へ増やし、次の 1 分で 50 VU へ増やし、最後の 30 秒で 0 VU へ戻す、合計 2 分間の負荷試験です。
 段階的に増やすことで、どのあたりからレイテンシや失敗率が変わるのかを見やすくします。
+
+</details>
 
 ### thresholds は性能のテスト
 
@@ -136,16 +172,6 @@ const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
 
 ```js title="load/day07-baseline.js"
 export function setup() {
-  const links = [];
-
-  for (let i = 0; i < 100; i += 1) {
-    const url = `https://example.com/day07/seed/${i}`;
-    const res = createLink(url);
-    const code = responseCode(res);
-    const ok = check(res, {
-      'setup create returns 201': (r) => r.status === 201,
-      'setup create has code': () => Boolean(code),
-    });
 ```
 
 `setup` で作った `links` は、`default` 関数に渡されます。
@@ -153,12 +179,6 @@ export function setup() {
 
 ```js title="load/day07-baseline.js"
 export default function (data) {
-  if (Math.random() < 0.9) {
-    const link = data.links[Math.floor(Math.random() * data.links.length)];
-    const res = http.get(`${BASE_URL}/${link.code}`, {
-      redirects: 0,
-      tags: { name: 'GET /{code}' },
-    });
 ```
 
 URL 短縮サービスでは、1 回作った短縮 URL が何度もクリックされるため、一般に作成よりリダイレクトのほうが多くなります。
@@ -215,6 +235,9 @@ CPU の使われ方、メモリの使われ方、goroutine の状態などを HT
 本番 API と同じポートに何となく出すものではありません。
 そのため、このリポジトリでは `DEBUG_ADDR` が設定されたときだけ、別の HTTP サーバとして pprof を公開します。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/cmd/server/main.go"
 func newDebugServer() *http.Server {
 	addr := os.Getenv("DEBUG_ADDR")
@@ -246,6 +269,8 @@ if debugServer != nil {
 
 別ポートにする理由は、通常のユーザー向け API とデバッグ用 API を分け、`DEBUG_ADDR` を設定したときだけ明示的に有効化し、将来の本番構成で内部ネットワークからだけ見せる設計にしやすくするためです。
 
+</details>
+
 pprof の基本として、まず見るのは `profile` と `heap` です。
 `profile` は指定した秒数のあいだ、どの関数で CPU 時間を使っていたかを見ます。
 `heap` は、どの経路でメモリが確保されているかを見るメモリプロファイルです。
@@ -255,28 +280,43 @@ pprof の基本として、まず見るのは `profile` と `heap` です。
 
 ## 手を動かす
 
-まず Compose で app と Postgres を起動します。
-Day 6 と同じく、`deploy/` に移動してから実行します。
+### 1. TODO を実装する
 
-```sh
-cd deploy
-docker compose up -d --build
+`work/app/cmd/server/main.go`、`work/load/day07-baseline.js`、`work/load/README.md` の TODO を実装します。
+まず `./study todo` で残っている箇所を確認し、上の「今日つくるもの」にある振る舞いを一つずつ満たしてください。
+
+`main.go` では `newDebugServer()` の中身だけでなく、通常サーバと一緒に起動し、終了シグナルを受けたときに shutdown するところまでつなぎます。
+k6 スクリプトでは、先に API の契約と合格条件を整理してから、`setup`、90/10 の分岐、check、`sleep` の順に組み立てると進めやすくなります。
+
+### 2. `./study test` で確かめる
+
+リポジトリのルートで合格条件を確認します。
+
+```bash
+./study test
 ```
 
-現在の `compose.yaml` では Redis も定義済みです。
-Day 7 のベースラインとして測るため、app だけを止め、`REDIS_ADDR` を空に上書きして起動し直します。
+すべて実装できると、TODO、k6 の設定、pprof の組み込みに緑のチェックが付き、最後に次のメッセージが表示されます。
 
-```sh
-docker compose stop app
-docker compose run --rm --service-ports -e REDIS_ADDR= app
+```txt
+✅ Day07 の合格条件を満たしています
 ```
 
-このコマンドは実行中のままにし、別ターミナルで以降の `curl` と `k6` を実行します。
-同じ意図で、`deploy/compose.yaml` の app 環境変数から `REDIS_ADDR` を一時的にコメントアウトして `docker compose up -d --build` しても構いません。
+失敗した項目があれば、その項目だけを直してもう一度実行してください。
+k6 がインストール済みなら、`./study test --full` でサーバの起動と負荷試験の完走まで確かめられます。
 
-ヘルスチェックで、アプリが起動していることを確認します。
+### 3. `./study run` で API を実際に叩く
 
-```sh
+自分が実装したコードで通常 API と pprof を起動します。
+リポジトリのルートで、デバッグ用アドレスを指定してサーバを起動してください。
+
+```bash
+DEBUG_ADDR=:6060 ./study run
+```
+
+サーバを起動したまま、別のターミナルからヘルスチェックします。
+
+```bash
 curl http://localhost:8080/healthz
 ```
 
@@ -286,17 +326,64 @@ curl http://localhost:8080/healthz
 ok
 ```
 
-次に、リポジトリルートへ戻って k6 を実行します。
+短縮 URL を 1 つ作ります。
 
-```sh
-cd ..
-k6 run load/day07-baseline.js
+```bash
+curl -s -X POST http://localhost:8080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/day7"}'
+```
+
+期待出力は次のような JSON です。
+最初の作成なら `code` は `1` になります。
+
+```json
+{"code":"1","short_url":"http://localhost:8080/1"}
+```
+
+リダイレクトを確認します。
+
+```bash
+curl -i http://localhost:8080/1
+```
+
+期待出力では、`302 Found` と `Location` ヘッダーが見えます。
+
+```txt
+HTTP/1.1 302 Found
+Location: https://example.com/day7
+```
+
+pprof の一覧も開いてみましょう。
+
+```bash
+open http://localhost:6060/debug/pprof/
+```
+
+確認できたら、`./study run` を実行しているターミナルで <kbd>Ctrl</kbd> + <kbd>C</kbd> を押して停止します。
+通常 API とデバッグサーバの両方が終了すれば、shutdown の接続もできています。
+
+### 4. Compose + Postgres に k6 で負荷をかける
+
+Day 7 のベースラインは、Day 6 で作った app + Postgres 構成で測ります。
+演習の成果物は `work/` にあるため、`work/deploy/` に移動して起動します。
+
+```bash
+cd work/deploy
+docker compose up -d --build
+```
+
+リポジトリルートへ戻って、自分が作った k6 スクリプトを実行します。
+
+```bash
+cd ../..
+k6 run work/load/day07-baseline.js
 ```
 
 接続先を明示したい場合は、次のように `BASE_URL` を指定します。
 
-```sh
-BASE_URL=http://localhost:8080 k6 run load/day07-baseline.js
+```bash
+BASE_URL=http://localhost:8080 k6 run work/load/day07-baseline.js
 ```
 
 出力では、まず `checks` を見ます。
@@ -327,40 +414,34 @@ http_req_duration..............: avg=1.76ms p(90)=2.51ms p(95)=3.04ms max=9.37ms
 http_reqs......................: 3250   26.97/s
 ```
 
-この結果を `load/README.md` の表へ転記します。
-このタスクでは教材ページだけを作るため実際には編集しませんが、自分の学習メモでは次のように残します。
+環境によって数値は変わります。
+自分の結果を `work/load/README.md` の表へ転記し、後日の比較に使えるよう、構成と負荷条件も一緒に残します。
 
 ```md title="load/README.md"
 | Day7 baseline | キャッシュなし、単体アプリ、Compose + Postgres、0→20→50VU/2分 | 3.04 | 3150 | 3250 | 26.97 req/s、avg 1.76ms、失敗 0%、checks 6500/6500 |
 ```
 
-pprof も開いてみます。
-通常の Compose 起動では `DEBUG_ADDR` を有効にしていないため、いったん app だけ止め、同じ Compose ネットワーク上でデバッグポート付きの app を起動します。
-Postgres は起動したままにします。
-上の `docker compose run --rm --service-ports -e REDIS_ADDR= app` を実行中の場合は、そのターミナルで `Ctrl+C` してから進めます。
+### 5. 負荷中の pprof を見る
 
-```sh
-cd deploy
+通常の Compose 起動では `DEBUG_ADDR` を有効にしていません。
+app だけを止め、Postgres は起動したまま、同じ Compose ネットワーク上でデバッグポート付きの app を起動します。
+
+```bash
+cd work/deploy
 docker compose stop app
 docker compose run --rm --service-ports -p 6060:6060 -e DEBUG_ADDR=:6060 app
-```
-
-別のターミナルで、pprof の一覧を開きます。
-
-```sh
-open http://localhost:6060/debug/pprof/
 ```
 
 CPU プロファイルを見るには、負荷をかけている最中に次を実行します。
 30 秒間サンプルを集め、ブラウザで結果を見ます。
 
-```sh
+```bash
 go tool pprof -http=:0 'http://localhost:6060/debug/pprof/profile?seconds=30'
 ```
 
 メモリの様子を見るには、heap を開きます。
 
-```sh
+```bash
 go tool pprof -http=:0 http://localhost:6060/debug/pprof/heap
 ```
 
@@ -370,9 +451,16 @@ CPU なら「時間を使っている関数」、heap なら「メモリを確�
 
 確認が終わったら、片付けます。
 
-```sh
+```bash
 docker compose down -v
 ```
+
+## 詰まったら
+
+- `./study hint` は、答えを開く前に考え方や用語を確認したいときに使います。
+- `./study todo` は、`work/` に残っている未実装の関数やファイルを一覧したいときに使います。
+- `./study answer` は、自分の実装と Day 7 の模範解答の差分をまとめて確認したいときに使います。
+- `./study peek <パス>` は、どうしても進めないファイルだけ模範解答をそのまま読みたいときに使います。たとえば `./study peek load/day07-baseline.js` です。
 
 ## クイズ
 

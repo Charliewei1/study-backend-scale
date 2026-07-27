@@ -8,8 +8,23 @@ sidebar:
 
 import Quiz from '../../components/Quiz.astro';
 
+## 始め方
+
+まず、リポジトリのルートで Day 1 の演習を用意します。
+
+```bash
+./study start 1
+```
+
+`work/` に、これから実装する関数が `panic("TODO: ...")` になった骨組みが置かれます。
+すぐに答えを見ず、まずは次のコマンドを実行して、未実装の状態ではテストが落ちることを確認してから始めましょう。
+
+```bash
+./study test
+```
+
 :::note[このページのコードについて]
-このページは Day 1 時点のコードを解説しています。当時のコードは `git checkout day01` で確認できます。最新のリポジトリには後日の機能追加が含まれます。
+このページは Day 1 時点のコードを解説しています。`./study start 1` で当時の状態から演習を始められます。模範解答は `./study peek app/internal/handler/handler.go` のように読めます。
 :::
 
 ## 今日のゴール
@@ -20,6 +35,39 @@ import Quiz from '../../components/Quiz.astro';
 - goroutine と共有データの関係を知り、mutex が必要な理由を説明できるようになる。
 - base62 の考え方と、6 文字で `62^6` 通りを表せる理由を計算できるようになる。
 - `go run` と `curl` で、作成、リダイレクト、ヘルスチェックを確認する。
+
+## 今日つくるもの
+
+今日は `work/app/` に、Go の標準ライブラリだけで動く URL 短縮サーバを完成させます。
+実装方法は一つではありません。まずは、次の契約を満たすことを目標にしてください。
+
+- `app/cmd/server/main.go`
+  - `func main()` を実装する。
+  - 環境変数 `PORT` を読み、未指定なら `8080` で HTTP サーバを起動する。
+- `app/internal/handler/handler.go`
+  - `func New(shortener *shortener.Shortener, store *storage.MemoryStore, baseURL string) http.Handler`
+  - `func (h *Handler) healthz(w http.ResponseWriter, r *http.Request)`
+  - `func (h *Handler) createLink(w http.ResponseWriter, r *http.Request)`
+  - `func (h *Handler) redirect(w http.ResponseWriter, r *http.Request)`
+  - `GET /healthz` は `200 OK` と `ok` を返す。
+  - `POST /api/links` は `{"url":"..."}` を受け取り、`201 Created` と `code`、`short_url` を含む JSON を返す。
+  - 壊れた JSON は `400 Bad Request` と `invalid json`、空の URL は `400 Bad Request` と `url is required` を返す。
+  - `GET /{code}` は、保存済みなら元の URL へ `302 Found` でリダイレクトし、未登録なら `404 Not Found` を返す。
+- `app/internal/shortener/shortener.go`
+  - `func New() *Shortener`
+  - `func (s *Shortener) Next() string`
+  - `func Encode(id uint64) string`
+  - 採番は `1` から始まり、呼び出すたびに重複しない次の base62 コードを返す。
+  - `Encode` は `0`〜`9`、`a`〜`z`、`A`〜`Z` の順の 62 文字を使い、`0` は `"0"`、`61` は `"Z"`、`62` は `"10"` に変換する。
+  - 複数リクエストから同時に採番されても、共有する ID を安全に扱えるようにする。
+- `app/internal/storage/memory.go`
+  - `func NewMemoryStore() *MemoryStore`
+  - `func (s *MemoryStore) Save(code, url string)`
+  - `func (s *MemoryStore) Load(code string) (url string, ok bool)`
+  - コードと URL の対応をメモリに保存し、同じコードへの再保存では新しい URL で上書きする。
+  - 未登録のコードは `ok=false` で返し、複数リクエストからの読み書きを安全に扱えるようにする。
+- 合格条件
+  - `./study test` を実行し、TODO が残っていないこと、`go build ./...`、`go vet ./...`、`go test ./...` がすべて成功すること。
 
 ## 解説
 
@@ -36,6 +84,9 @@ Go の標準ライブラリだけで、HTTP、JSON、リダイレクト、排他
 Go は「読んだときに何が起きるか追いやすいこと」を大事にします。
 このアプリの起動処理も、環境変数を読み、部品を作り、HTTP サーバを起動するだけです。
 まず `main` 関数を見てみましょう。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```go title="app/cmd/server/main.go"
 func main() {
@@ -61,6 +112,8 @@ func main() {
 
 Go では、アプリの入口は `main` パッケージの `main` 関数です。
 失敗する可能性がある処理はエラーを返し、ここでも `http.ListenAndServe` のエラーを明示的に確認しています。
+
+</details>
 
 ### パッケージ構成: 責務ごとに分ける
 
@@ -88,6 +141,9 @@ Go の標準ライブラリには `net/http` があります。
 このアプリは外部ルーターではなく、標準の `http.ServeMux` を使っています。
 `ServeMux` は、HTTP メソッドとパスを見て、どの関数へ処理を渡すか決める部品です。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/handler/handler.go"
 func New(shortener *shortener.Shortener, store *storage.MemoryStore, baseURL string) http.Handler {
 	h := &Handler{
@@ -108,11 +164,16 @@ func New(shortener *shortener.Shortener, store *storage.MemoryStore, baseURL str
 `POST /api/links` は短縮 URL を作ります。
 `GET /{code}` は、`/1` のようなパスから `code` を取り出してリダイレクトします。
 
+</details>
+
 `"METHOD /path"` という書き方は Go 1.22 以降の `ServeMux` のパターンです。
 `GET /{code}` の `{code}` は、あとで `r.PathValue("code")` で取り出せます。
 このため Day 1 では、ルーティング用のフレームワークを入れなくても十分です。
 
 短縮 URL を作る処理は `createLink` です。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```go title="app/internal/handler/handler.go"
 func (h *Handler) createLink(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +203,12 @@ HTTP ハンドラは `http.ResponseWriter` と `*http.Request` を受け取り�
 `r.Body` から `{"url":"https://..."}` を読み、壊れた JSON や空の URL なら `400 Bad Request` を返します。
 問題なければ `h.shortener.Next()` でコードを作り、`h.store.Save(code, req.URL)` で保存し、`201 Created` と JSON を返します。
 
+</details>
+
 リダイレクトは `redirect` です。
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```go title="app/internal/handler/handler.go"
 func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
@@ -160,6 +226,8 @@ func (h *Handler) redirect(w http.ResponseWriter, r *http.Request) {
 `r.PathValue("code")` で `/1` の `1` を取り出します。
 保存先にあれば `http.Redirect` で元 URL へ `302 Found` を返します。
 なければ `404 Not Found` です。
+
+</details>
 
 ヘルスチェックは、今は単に `ok` を返します。
 Day 10 で Kubernetes の liveness/readiness を扱うとき、この考え方が戻ってきます。
@@ -185,6 +253,9 @@ type Shortener struct {
 `Next()` は `nextID` を読み、1 増やし、base62 に変換します。
 `Lock()` から `Unlock()` までの間は同時に 1 つの goroutine だけが入れるため、ID の重複を防げます。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/shortener/shortener.go"
 func (s *Shortener) Next() string {
 	s.mu.Lock()
@@ -195,6 +266,8 @@ func (s *Shortener) Next() string {
 	return Encode(id)
 }
 ```
+
+</details>
 
 メモリ保存先は `map[string]string` を使います。
 キーが短縮コード、値が元 URL です。
@@ -210,6 +283,9 @@ Go の `map` は、そのままでは同時読み書きに安全ではありま�
 そこで `sync.RWMutex` を使います。
 書き込みの `Save` では `Lock()`、読み取りの `Load` では `RLock()` です。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/storage/memory.go"
 func (s *MemoryStore) Save(code, url string) {
 	s.mu.Lock()
@@ -218,6 +294,11 @@ func (s *MemoryStore) Save(code, url string) {
 	s.links[code] = url
 }
 ```
+
+</details>
+
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
 
 ```go title="app/internal/storage/memory.go"
 func (s *MemoryStore) Load(code string) (url string, ok bool) {
@@ -228,6 +309,8 @@ func (s *MemoryStore) Load(code string) (url string, ok bool) {
 	return url, ok
 }
 ```
+
+</details>
 
 `RWMutex` は読み取り同士を複数同時に通せます。
 URL 短縮サービスは「作成」より「リダイレクト」のほうが多くなりやすいので、この性質は題材に合っています。
@@ -262,6 +345,9 @@ const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
 数値を 62 で割り、余りを 1 桁として取り出します。
 余りは下の桁から出るので、最後に反転します。
 
+<details>
+<summary>実装を見る（先に自分で書いてから開こう）</summary>
+
 ```go title="app/internal/shortener/shortener.go"
 func Encode(id uint64) string {
 	if id == 0 {
@@ -291,14 +377,39 @@ func Encode(id uint64) string {
 
 Day 1 の `Shortener` は `nextID: 1` から始めるので、最初に作られるコードは `"1"` です。
 
+</details>
+
 ## 手を動かす
 
-ターミナルを 2 つ使います。
-1 つ目でサーバを起動し、2 つ目で `curl` を実行します。
+### 1. TODO を実装する
 
-```sh
-cd app
-go run ./cmd/server
+`work/app/` のコードを開き、`panic("TODO: ...")` になっている関数を実装します。
+上の「今日つくるもの」を契約として使い、まずは自分で考えて書いてみましょう。
+
+残っている TODO は、いつでも次のコマンドで確認できます。
+
+```bash
+./study todo
+```
+
+### 2. テストで確かめる
+
+実装できたら、リポジトリのルートで合格条件を確認します。
+
+```bash
+./study test
+```
+
+失敗したときは、表示されたビルドエラーやテスト名を手がかりにコードを直し、もう一度実行してください。
+すべての項目が成功するまで、この往復を続けます。
+
+### 3. サーバを起動して実際に叩く
+
+自動テストが通ったら、ターミナルを 2 つ使って API の動きを確かめます。
+1 つ目のターミナルで、実装したサーバを起動します。
+
+```bash
+./study run
 ```
 
 期待するログは次の形です。
@@ -369,6 +480,13 @@ Content-Type: text/plain; charset=utf-8
 ```
 
 ここまでで、`POST /api/links`、`GET /{code}`、`GET /healthz` の API 契約を確認できました。
+
+## 詰まったら
+
+- `./study hint`: 今日の解説を読み、考え方や関連する概念を確認します。
+- `./study todo`: まだ実装していない TODO を一覧で確認します。
+- `./study answer`: 自分のコードと模範解答の差分を見て、どこが違うかを確認します。
+- `./study peek <パス>`: 指定したファイルの模範解答をそのまま表示します。最後の手段として、たとえば `./study peek app/internal/handler/handler.go` のように使います。
 
 ## クイズ
 
