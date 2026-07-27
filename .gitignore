@@ -17,3 +17,6 @@ tmp/
 .DS_Store
 .idea/
 .vscode/
+work/
+work.prev/
+.study/

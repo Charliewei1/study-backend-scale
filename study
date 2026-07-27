@@ -1,0 +1,474 @@
+#!/bin/bash
+# study — 15日間のバックエンド課題を進めるための唯一のコマンド。
+#
+# gitのタグ操作はこの中に隠してあるので、学習者はDay番号だけ意識すれば進められます。
+#
+#   ./study                 いまの状況と使い方
+#   ./study start 3         Day03の演習を work/ に用意する
+#   ./study test            その日の合格条件をチェックする
+#   ./study test --full     重い検証まで走らせる（docker build、kind、k6）
+#   ./study todo            残っているTODOを一覧する
+#   ./study hint            今日の解説を読む
+#   ./study docs            解説サイトをブラウザで開く
+#   ./study answer          自分のコードと模範解答の差分を見る
+#   ./study peek <path>     模範解答をそのまま見る
+#   ./study run             書いたサーバを起動する
+#   ./study reset           今日を最初からやり直す
+#   ./study days            15日間の一覧
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+WORK="$ROOT/work"
+STATE="$ROOT/.study"
+SKELETON="$STATE/skeleton"
+CHECKS="$ROOT/study.d"
+
+cd "$ROOT"
+
+# ------------------------------------------------------------------ 表示
+
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+dim() { printf '\033[2m%s\033[0m\n' "$1"; }
+green() { printf '\033[32m%s\033[0m\n' "$1"; }
+red() { printf '\033[31m%s\033[0m\n' "$1"; }
+die() {
+	printf '\033[31m%s\033[0m\n' "$1" >&2
+	exit 1
+}
+
+day_title() {
+	case "$1" in
+	01) echo "Go入門 — 最小のURL短縮サーバ" ;;
+	02) echo "API設計とテスト文化 — httptest、table-driven" ;;
+	03) echo "永続化とインターフェース設計 — SQLite、DI" ;;
+	04) echo "Goの並行処理 — channel、race detector、graceful shutdown" ;;
+	05) echo "Dockerでコンテナ化 — multi-stage、distroless" ;;
+	06) echo "Docker ComposeとPostgres移行" ;;
+	07) echo "計測 — k6ベースラインとpprof" ;;
+	08) echo "Redisキャッシュ — cache-aside、TTL" ;;
+	09) echo "Kubernetes入門 — kindで動かす" ;;
+	10) echo "k8s設定・probe・ローリング更新" ;;
+	11) echo "水平スケールとHPA — ステートレス設計" ;;
+	12) echo "可観測性 — Prometheus、構造化ログ" ;;
+	13) echo "レートリミットと回復性 — token bucket、タイムアウト" ;;
+	14) echo "シャーディングと分散の理論 — consistent hashing" ;;
+	15) echo "総仕上げ — フルスタックデプロイと最終計測" ;;
+	*) echo "" ;;
+	esac
+}
+
+# その日の主役が何か（テストの走らせ方が変わる）
+day_kind() {
+	case "$1" in
+	05 | 09 | 15) echo "infra" ;;
+	07) echo "measure" ;;
+	*) echo "go" ;;
+	esac
+}
+
+normalize_day() {
+	local raw="${1#day}"
+	raw="${raw#0}"
+	[ -n "$raw" ] || die "Day番号を指定してください（例: ./study start 3）"
+	case "$raw" in
+	[0-9] | 1[0-5]) printf '%02d' "$raw" ;;
+	*) die "Day番号は 1〜15 です（受け取った値: $1）" ;;
+	esac
+}
+
+current_day() {
+	[ -f "$STATE/current" ] && cat "$STATE/current" || echo ""
+}
+
+require_work() {
+	[ -d "$WORK" ] || die "まだ演習が始まっていません。まず ./study start 1 を実行してください。"
+}
+
+# ------------------------------------------------------------------ 準備
+
+build_skeleton() {
+	mkdir -p "$STATE"
+	if [ ! -x "$SKELETON" ] || [ tools/skeleton/main.go -nt "$SKELETON" ]; then
+		(cd tools/skeleton && go build -o "$SKELETON" .)
+	fi
+}
+
+# 演習に配るファイル。docs/ と plans/ と tools/ は教材側なので配らない。
+practice_paths() {
+	grep -Ev '^(docs/|plans/|tools/|study\.d/|\.github/|study$|\.gitignore$|README\.md$)'
+}
+
+build_day() {
+	local day="$1"
+	local tag="day$day"
+	local prev_num=$((10#$day - 1))
+	local prev_tag=""
+	[ "$prev_num" -ge 1 ] && prev_tag="$(printf 'day%02d' "$prev_num")"
+
+	rm -rf "$WORK"
+	mkdir -p "$WORK"
+
+	local file
+	# 1) 前日までの完成コードを土台にする
+	if [ -n "$prev_tag" ]; then
+		for file in $(git ls-tree -r --name-only "$prev_tag" | practice_paths); do
+			mkdir -p "$WORK/$(dirname "$file")"
+			git show "$prev_tag:$file" >"$WORK/$file"
+		done
+	fi
+
+	# 2) その日の差分を反映する
+	local list
+	if [ -n "$prev_tag" ]; then
+		list=$(git diff --name-status "$prev_tag" "$tag" | grep -E "$(printf '\t')(app|deploy|load)/" || true)
+	else
+		list=$(git ls-tree -r --name-only "$tag" | practice_paths | sed 's/^/A\t/' || true)
+	fi
+
+	local status
+	while IFS=$'\t' read -r status file; do
+		[ -n "${file:-}" ] || continue
+		mkdir -p "$WORK/$(dirname "$file")"
+
+		case "$status:$file" in
+		D:*)
+			rm -f "$WORK/$file"
+			;;
+		*:*_test.go)
+			# テストはその日の仕様書。完成品を渡す。
+			git show "$tag:$file" >"$WORK/$file"
+			;;
+		*:*.sum | *:*go.mod)
+			# 依存関係は課題ではないので、その日の完成品をそのまま渡す。
+			git show "$tag:$file" >"$WORK/$file"
+			;;
+		A:*.go)
+			git show "$tag:$file" >"$STATE/new.go"
+			"$SKELETON" stub "$STATE/new.go" >"$STATE/out.go" ||
+				die "骨組みの生成に失敗しました: $file"
+			mv "$STATE/out.go" "$WORK/$file"
+			;;
+		M:*.go)
+			git show "$prev_tag:$file" >"$STATE/old.go"
+			git show "$tag:$file" >"$STATE/new.go"
+			"$SKELETON" merge "$STATE/old.go" "$STATE/new.go" >"$STATE/out.go" ||
+				die "骨組みの生成に失敗しました: $file"
+			mv "$STATE/out.go" "$WORK/$file"
+			;;
+		*)
+			# Go以外（Dockerfile / YAML / k6スクリプト）は雛形を置く。
+			write_infra_skeleton "$tag" "$file"
+			;;
+		esac
+	done <<<"$list"
+
+	rm -f "$STATE/old.go" "$STATE/new.go" "$STATE/out.go"
+	echo "$day" >"$STATE/current"
+	write_work_docs "$day"
+}
+
+# Dockerfile や YAML は、コメントと「何を書くか」だけ残して中身を空にする。
+write_infra_skeleton() {
+	local tag="$1" file="$2"
+	local tmpl="$CHECKS/skel/$tag/$(basename "$file")"
+
+	if [ -f "$tmpl" ]; then
+		cp "$tmpl" "$WORK/$file"
+		return
+	fi
+
+	{
+		echo "# TODO: $file を書こう（Day${tag#day}）"
+		echo "#"
+		echo "# 何を書くかは ./study hint、書けたかどうかは ./study test で確認できます。"
+		echo "# 模範解答を見たいときは ./study peek $file"
+		echo "#"
+		echo "# 元のファイルにあったコメントだけ残してあります："
+		git show "$tag:$file" | grep -E '^\s*#' || true
+	} >"$WORK/$file"
+}
+
+write_work_docs() {
+	local day="$1"
+	local title prior kind
+	title="$(day_title "$day")"
+	kind="$(day_kind "$day")"
+	if [ "$day" = "01" ]; then
+		prior="Goの基本文法まで"
+	else
+		prior="Day$(printf '%02d' $((10#$day - 1))) まで"
+	fi
+
+	{
+		echo "# いま取り組んでいるのは Day$day"
+		echo
+		echo "**$title**"
+		echo
+		echo '---'
+		echo
+		echo '## 伴走するCoding Agentへ'
+		echo
+		echo "このディレクトリ \`work/\` は学習者の演習場です。**答えを書く場所ではありません。**"
+		echo
+		echo "- 学習者は Day$day に取り組んでいます。**${prior}の内容は理解している前提**で話してください。"
+		echo "- **まだ習っていない概念を先取りして持ち出さないでください。** 各Dayの範囲は \`../plans/CURRICULUM.md\` にあります。"
+		echo "- 求められたらまずヒントを出します。コードを書くのは学習者です。"
+		echo "- 「代わりに書いて」と明示的に頼まれた場合だけ実装してかまいません。"
+		echo "- \`TODO\` が残っている箇所が、今日の課題です。"
+		echo "- 模範解答は \`git show day$day:<パス>\` で読めますが、**聞かれる前に貼らないでください。**"
+		case "$kind" in
+		infra) echo "- 今日はコードではなく **Dockerfile / マニフェスト** が成果物です。\`./study test --full\` で実際にビルドして確かめます。" ;;
+		measure) echo "- 今日は **計測** が成果物です。数値を読んで解釈できるように助けてください。" ;;
+		esac
+		echo
+		echo '## 使えるコマンド（リポジトリのルートで実行）'
+		echo
+		echo '```bash'
+		echo './study test        # 今日の合格条件'
+		echo './study test --full # 重い検証まで（docker build / kind / k6）'
+		echo './study todo        # 残っているTODO'
+		echo './study hint        # 今日の解説'
+		echo './study answer      # 模範解答との差分'
+		echo '```'
+		echo
+		echo '## 今日やること'
+		echo
+		todo_list
+	} >"$WORK/AGENTS.md"
+
+	{
+		echo "# Day$day のヒント"
+		echo
+		echo "**$title**"
+		echo
+		echo '## 今日やること'
+		echo
+		todo_list
+		echo
+		echo '## 確認のしかた'
+		echo
+		echo '```bash'
+		echo './study test'
+		echo './study test --full'
+		echo './study answer'
+		echo '```'
+		echo
+		echo '---'
+		echo
+		if [ -f "$ROOT/docs/src/content/docs/day$day.mdx" ]; then
+			sed -e 's/^import Quiz.*$//' "$ROOT/docs/src/content/docs/day$day.mdx"
+		fi
+	} >"$WORK/HINTS.md"
+}
+
+todo_list() {
+	local found=0 file name line
+	while IFS= read -r file; do
+		while IFS= read -r line; do
+			name="${line#*panic(\"TODO: }"
+			name="${name%\"*}"
+			echo "- \`${file#$WORK/}\` … $name"
+			found=1
+		done < <(grep -o 'panic("TODO: [^"]*"' "$file" 2>/dev/null || true)
+	done < <(find "$WORK" -name '*.go' -type f 2>/dev/null | sort)
+
+	while IFS= read -r file; do
+		echo "- \`${file#$WORK/}\` … ファイルを書く"
+		found=1
+	done < <(grep -rl '^# TODO:' "$WORK" 2>/dev/null | sort || true)
+
+	if [ "$found" = 0 ]; then
+		echo "- （骨組みはありません。テストと解説を読んで、既存コードを直していきます）"
+	fi
+}
+
+# ------------------------------------------------------------------ 各コマンド
+
+cmd_start() {
+	local day
+	day="$(normalize_day "${1:-}")"
+	build_skeleton
+
+	if [ -d "$WORK" ]; then
+		rm -rf "$ROOT/work.prev"
+		cp -R "$WORK" "$ROOT/work.prev"
+		dim "（前回の work/ は work.prev/ に退避しました）"
+	fi
+
+	build_day "$day"
+
+	bold "Day$day を用意しました： $(day_title "$day")"
+	echo
+	echo "編集する場所： work/"
+	echo
+	todo_list
+	echo
+	dim "次に —  ./study test でまず落ちることを確かめてから、work/ の TODO を埋めます。"
+	dim "        ./study hint でその日の解説が読めます。"
+}
+
+cmd_test() {
+	require_work
+	local day full=0
+	day="$(current_day)"
+	[ "${1:-}" = "--full" ] && full=1
+
+	bold "Day$day の合格条件をチェックします"
+	echo
+
+	local script="$CHECKS/day$day.sh"
+	if [ ! -f "$script" ]; then
+		script="$CHECKS/default.sh"
+	fi
+
+	set +e
+	WORK="$WORK" ROOT="$ROOT" DAY="$day" FULL="$full" bash "$script"
+	local code=$?
+	set -e
+
+	echo
+	if [ $code -eq 0 ]; then
+		green "✅ Day$day の合格条件を満たしています"
+		[ "$full" = 0 ] && dim "（./study test --full で、実際のビルドや起動まで確かめられます）"
+	else
+		red "❌ まだ満たしていない条件があります"
+		dim "（./study hint で解説、./study answer で模範解答との差分）"
+	fi
+	return $code
+}
+
+cmd_todo() {
+	require_work
+	bold "Day$(current_day) の残りTODO"
+	echo
+	todo_list
+}
+
+cmd_hint() {
+	require_work
+	if command -v less >/dev/null 2>&1 && [ -t 1 ]; then
+		less -R "$WORK/HINTS.md"
+	else
+		cat "$WORK/HINTS.md"
+	fi
+}
+
+cmd_docs() {
+	bold "解説サイトを起動します（Ctrl-C で停止）"
+	dim "初回は npm install に少し時間がかかります"
+	(cd "$ROOT/docs" && [ -d node_modules ] || (cd "$ROOT/docs" && npm install))
+	(cd "$ROOT/docs" && npm run dev)
+}
+
+cmd_answer() {
+	require_work
+	local day tag file
+	day="$(current_day)"
+	tag="day$day"
+
+	if [ $# -gt 0 ]; then
+		git show "$tag:$1" >"$STATE/answer.txt"
+		bold "$1 — あなた（左） vs 模範解答（右）"
+		diff -u "$WORK/$1" "$STATE/answer.txt" || true
+		rm -f "$STATE/answer.txt"
+		return
+	fi
+
+	bold "Day$day 模範解答との差分"
+	dim "左 = あなたのコード / 右 = 模範解答"
+	echo
+	while IFS= read -r file; do
+		local rel="${file#$WORK/}"
+		if git cat-file -e "$tag:$rel" 2>/dev/null; then
+			git show "$tag:$rel" >"$STATE/answer.txt"
+			if ! diff -q "$file" "$STATE/answer.txt" >/dev/null; then
+				echo "--- $rel"
+				diff -u "$file" "$STATE/answer.txt" | tail -n +3 || true
+				echo
+			fi
+		fi
+	done < <(find "$WORK" -type f \( -name '*.go' -o -name '*.yaml' -o -name '*.yml' -o -name '*.js' -o -name 'Dockerfile*' \) | sort)
+	rm -f "$STATE/answer.txt"
+}
+
+cmd_peek() {
+	require_work
+	[ $# -gt 0 ] || die "パスを指定してください（例: ./study peek app/internal/handler/handler.go）"
+	git show "day$(current_day):$1"
+}
+
+cmd_run() {
+	require_work
+	[ -d "$WORK/app" ] || die "work/app がありません"
+	bold "サーバを起動します（Ctrl-C で停止）"
+	dim "別のターミナルから: curl -X POST localhost:8080/api/links -d '{\"url\":\"https://example.com\"}'"
+	echo
+	(cd "$WORK/app" && go run ./cmd/server "$@")
+}
+
+cmd_reset() {
+	require_work
+	local day
+	day="$(current_day)"
+	build_skeleton
+	rm -rf "$ROOT/work.prev"
+	cp -R "$WORK" "$ROOT/work.prev"
+	build_day "$day"
+	bold "Day$day を作り直しました（前の内容は work.prev/ にあります）"
+}
+
+cmd_days() {
+	bold "15日間の流れ"
+	echo
+	local n day marker
+	for n in $(seq 1 15); do
+		day="$(printf '%02d' "$n")"
+		marker="  "
+		[ "$day" = "$(current_day)" ] && marker="→ "
+		printf '%sDay%s  %s\n' "$marker" "$day" "$(day_title "$day")"
+	done
+	echo
+	dim "./study start <番号> で、その日の演習を用意します。"
+}
+
+cmd_status() {
+	local day
+	day="$(current_day)"
+	if [ -z "$day" ] || [ ! -d "$WORK" ]; then
+		bold "URL短縮で学ぶ バックエンド15日間"
+		echo
+		echo "まだ始まっていません。次のコマンドでDay01から始めます。"
+		echo
+		echo "  ./study start 1"
+		echo
+		dim "全体の流れは ./study days で見られます。"
+		return
+	fi
+
+	bold "いま Day$day： $(day_title "$day")"
+	echo
+	todo_list
+	echo
+	echo "  ./study test     今日の合格条件をチェック"
+	echo "  ./study hint     今日の解説を読む"
+	echo "  ./study run      サーバを起動する"
+	echo "  ./study answer   模範解答と比べる"
+	echo "  ./study days     15日間の一覧"
+}
+
+case "${1:-status}" in
+start) shift; cmd_start "${1:-}" ;;
+test) shift; cmd_test "$@" ;;
+todo) cmd_todo ;;
+hint) cmd_hint ;;
+docs) cmd_docs ;;
+answer) shift; cmd_answer "$@" ;;
+peek) shift; cmd_peek "$@" ;;
+run) shift; cmd_run "$@" ;;
+reset) cmd_reset ;;
+days) cmd_days ;;
+status) cmd_status ;;
+-h | --help | help) cmd_status ;;
+*) die "知らないコマンドです: $1  （./study で使い方が出ます）" ;;
+esac
