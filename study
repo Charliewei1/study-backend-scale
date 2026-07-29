@@ -10,6 +10,8 @@
 #   ./study todo            残っているTODOを一覧する
 #   ./study hint            今日の解説を読む
 #   ./study docs            解説サイトをブラウザで開く
+#   ./study docs --phone    静的ビルドして同じWi-Fiのスマホから見る
+#   ./study docs --file     全15日をHTML1枚にまとめる（AirDrop用）
 #   ./study answer          自分のコードと模範解答の差分を見る
 #   ./study peek <path>     模範解答をそのまま見る
 #   ./study run             書いたサーバを起動する
@@ -356,9 +358,58 @@ cmd_hint() {
 }
 
 cmd_docs() {
+	[ -d "$ROOT/docs/node_modules" ] || {
+		dim "初回は npm install に少し時間がかかります"
+		(cd "$ROOT/docs" && npm install)
+	}
+
+	# サイトは GitHub Pages 用に base: /study-backend-scale を持っているので、
+	# dist/ を素のファイルサーバで配ると CSS のパスがずれる。
+	# astro preview は base を理解しているので、そちらを使う。
+	# base は astro.config.mjs の一行から読む（configのimportはTSを含むので重い）
+	local path
+	path="$(sed -n "s/^[[:space:]]*base:[[:space:]]*['\"]\([^'\"]*\)['\"].*/\1/p" "$ROOT/docs/astro.config.mjs" | head -1)"
+	path="${path%/}"
+
+	if [ "${1:-}" = "--file" ]; then
+		bold "全15日をHTML1枚にまとめます（AirDrop用）"
+		echo
+		(cd "$ROOT/docs" && npm run build) || die "ビルドに失敗しました"
+		echo
+		python3 "$ROOT/tools/bundle-docs.py" || die "まとめに失敗しました"
+		echo
+		green "このファイルをAirDropしてください:"
+		bold "    $ROOT/shortlink-15days.html"
+		echo
+		dim "外部通信なしで開けます。iPhoneなら「ファイル」アプリに保存 → タップでSafariが開きます。"
+		return
+	fi
+
+	if [ "${1:-}" = "--phone" ]; then
+		bold "静的ビルドして、同じWi-Fiの端末から見られるようにします"
+		echo
+		(cd "$ROOT/docs" && npm run build) || die "ビルドに失敗しました"
+
+		local ip
+		ip="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+		echo
+		if [ -n "$ip" ]; then
+			green "スマホのブラウザで開いてください:"
+			echo
+			bold "    http://$ip:4321$path/"
+			echo
+			dim "（同じWi-Fiに繋がっている必要があります。Ctrl-C で停止）"
+		else
+			dim "LANのIPアドレスが取得できませんでした。手元では http://localhost:4321$path/ で見られます。"
+		fi
+		echo
+		(cd "$ROOT/docs" && npm run preview -- --host 0.0.0.0)
+		return
+	fi
+
 	bold "解説サイトを起動します（Ctrl-C で停止）"
-	dim "初回は npm install に少し時間がかかります"
-	(cd "$ROOT/docs" && [ -d node_modules ] || (cd "$ROOT/docs" && npm install))
+	dim "編集するとその場で反映されます。スマホから見るなら ./study docs --phone"
+	echo
 	(cd "$ROOT/docs" && npm run dev)
 }
 
@@ -463,7 +514,7 @@ start) shift; cmd_start "${1:-}" ;;
 test) shift; cmd_test "$@" ;;
 todo) cmd_todo ;;
 hint) cmd_hint ;;
-docs) cmd_docs ;;
+docs) shift; cmd_docs "$@" ;;
 answer) shift; cmd_answer "$@" ;;
 peek) shift; cmd_peek "$@" ;;
 run) shift; cmd_run "$@" ;;
