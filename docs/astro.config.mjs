@@ -8,6 +8,13 @@ export default defineConfig({
     starlight({
       title: 'URL短縮で学ぶバックエンドスケーラビリティ',
       description: 'URL短縮サービスを題材に、Go、Docker、Kubernetes、計測、キャッシュ、スケール設計を15日で学ぶ教材です。',
+      social: [
+        {
+          icon: 'github',
+          label: 'GitHub',
+          href: 'https://github.com/Charliewei1/study-backend-scale',
+        },
+      ],
       locales: {
         root: {
           label: '日本語',
