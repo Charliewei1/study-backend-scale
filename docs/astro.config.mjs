@@ -2,7 +2,7 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
-  site: 'https://charliezo2001.github.io',
+  site: 'https://charliewei1.github.io',
   base: '/study-backend-scale',
   integrations: [
     starlight({
